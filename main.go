@@ -11,6 +11,7 @@ import (
 	"timetablex/scheduler"
 	"timetablex/types"
 	"timetablex/validator"
+	"timetablex/web"
 )
 
 func init() {
@@ -29,7 +30,18 @@ func main() {
 	seed := flag.Int64("seed", time.Now().UnixNano(), "Random seed for reproducibility")
 	attempts := flag.Int("attempts", 200, "Number of scheduling attempts")
 	verbose := flag.Bool("verbose", false, "Enable verbose output")
+	port := flag.Int("p", 0, "Start web server on specified port")
 	flag.Parse()
+
+	// If -p flag is set, start web server mode
+	if *port > 0 {
+		srv := web.NewServer(*port, *attempts)
+		if err := srv.Start(); err != nil {
+			fmt.Fprintf(os.Stderr, "Web server error: %v\n", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	if *verbose {
 		fmt.Printf("Using seed: %d\n", *seed)
