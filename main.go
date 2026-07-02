@@ -35,7 +35,7 @@ func main() {
 		fmt.Printf("Using seed: %d\n", *seed)
 	}
 
-	// Step 1: Parse config
+	// Step 1: Parse config.conf
 	if *verbose {
 		fmt.Println("Parsing config...")
 	}
@@ -53,7 +53,50 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Step 2: Validate
+	// Step 1.5: Check for config.txt (pre-defined schedule)
+	predefinedPath := "config.txt"
+	var predefinedData *types.PredefinedData
+	hasPredefined := false
+
+	if _, err := os.Stat(predefinedPath); err == nil {
+		if *verbose {
+			fmt.Println("Found config.txt, parsing pre-defined schedule...")
+		}
+
+		data, parseErrs := parser.ParsePredefined(predefinedPath)
+		if len(parseErrs) > 0 {
+			for _, err := range parseErrs {
+				fmt.Fprintf(os.Stderr, "Config.txt error: %v\n", err)
+			}
+			os.Exit(1)
+		}
+
+		// Validate predefined data against config.conf
+		if *verbose {
+			fmt.Println("Validating config.txt data...")
+		}
+
+		validationErrs := validator.ValidatePredefined(parseResult.Config, data)
+		if len(validationErrs) > 0 {
+			for _, err := range validationErrs {
+				fmt.Fprintf(os.Stderr, "Config.txt validation error: %v\n", err)
+			}
+			os.Exit(1)
+		}
+
+		predefinedData = data
+		hasPredefined = true
+
+		if *verbose {
+			fmt.Printf("Loaded %d predefined assignments from config.txt\n", len(predefinedData.Assignments))
+		}
+	} else {
+		if *verbose {
+			fmt.Println("No config.txt found, scheduling all offerings normally")
+		}
+	}
+
+	// Step 2: Validate config.conf
 	if *verbose {
 		fmt.Println("Validating config...")
 	}
@@ -67,27 +110,182 @@ func main() {
 		// Some are just warnings about feasibility
 	}
 
-	// Step 3: Check basic feasibility
-	if *verbose {
-		fmt.Println("Checking feasibility...")
+	// If we have predefined data, filter out matched offerings from scheduling pool
+	// and merge GU/IU entries
+	if hasPredefined {
+		var remainingOfferings []*types.Offering
+		for _, offering := range parseResult.Config.Offerings {
+			matched := false
+			for _, pa := range predefinedData.Assignments {
+				if pa.CourseID == offering.CourseID &&
+					pa.GroupIDRaw == offering.GroupIDRaw &&
+					pa.MainInstructorID == offering.MainInstructorID {
+					matched = true
+					break
+				}
+			}
+			if !matched {
+				remainingOfferings = append(remainingOfferings, offering)
+			}
+		}
+		parseResult.Config.Offerings = remainingOfferings
+
+		// Merge GU and IU from config.txt into config (for rendering and validation)
+		parseResult.Config.GroupsUnavailable = append(parseResult.Config.GroupsUnavailable, predefinedData.GroupsUnavailable...)
+		parseResult.Config.InstructorUnavailable = append(parseResult.Config.InstructorUnavailable, predefinedData.InstructorUnavailable...)
+
+		if *verbose {
+			fmt.Printf("Remaining offerings to schedule: %d (after removing %d predefined)\n",
+				len(remainingOfferings), len(predefinedData.Assignments))
+		}
 	}
 
-	feasible, reason := validator.CanSchedule(parseResult.Config)
-	if !feasible {
-		fmt.Fprintf(os.Stderr, "Error: %s\n", reason)
-		os.Exit(1)
+	// Step 3: Check basic feasibility (only if there are offerings to schedule)
+	if len(parseResult.Config.Offerings) > 0 {
+		if *verbose {
+			fmt.Println("Checking feasibility...")
+		}
+
+		feasible, reason := validator.CanSchedule(parseResult.Config)
+		if !feasible {
+			fmt.Fprintf(os.Stderr, "Error: %s\n", reason)
+			os.Exit(1)
+		}
+	} else if hasPredefined && *verbose {
+		fmt.Println("No offerings to schedule (all are predefined)")
 	}
 
-	// Step 4: Schedule
-	if *verbose {
-		fmt.Println("Scheduling...")
-	}
-
+	// Step 4: Schedule (only if there are offerings to schedule)
 	sch := scheduler.NewScheduler(parseResult.Config, *seed, *attempts, *verbose)
-	schedule, err := sch.Schedule()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	if hasPredefined {
+		sch.SetPredefinedAssignments(predefinedData.Assignments)
+	}
+
+	var schedule *types.Schedule
+
+	if len(parseResult.Config.Offerings) > 0 {
+		if *verbose {
+			fmt.Println("Scheduling...")
+		}
+
+		var err error
+		schedule, err = sch.Schedule()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+	} else if hasPredefined {
+		// All offerings are predefined — create an empty schedule with lunch break
+		if *verbose {
+			fmt.Println("All offerings are predefined, creating empty schedule...")
+		}
+		lunchBreak := make(map[types.Day]int)
+		// Pick a break period that doesn't conflict with predefined assignments
+		if len(parseResult.Config.Breaks.Periods) > 0 {
+			chosenBreak := 0
+			for _, bp := range parseResult.Config.Breaks.Periods {
+				hasConflict := false
+				for _, pa := range predefinedData.Assignments {
+					if scheduler.IsInPredefinedPeriod(pa, bp) {
+						hasConflict = true
+						break
+					}
+				}
+				if !hasConflict {
+					chosenBreak = bp
+					break
+				}
+			}
+			if chosenBreak == 0 && len(parseResult.Config.Breaks.Periods) > 0 {
+				// All break periods conflict with predefined — just use the first
+				chosenBreak = parseResult.Config.Breaks.Periods[0]
+			}
+			for _, day := range types.AllDays() {
+				lunchBreak[day] = chosenBreak
+			}
+		}
+		schedule = &types.Schedule{
+			LunchBreakDay: lunchBreak,
+			Config:        parseResult.Config,
+		}
+	}
+
+	// Step 4.5: Resolve $ rooms in predefined assignments
+	if schedule == nil {
+		fmt.Fprintf(os.Stderr, "Error: no schedule to validate\n")
 		os.Exit(1)
+	}
+
+	// Step 4.5: Resolve $ rooms in predefined assignments
+	if hasPredefined && len(predefinedData.Assignments) > 0 {
+		if *verbose {
+			fmt.Println("Resolving $ rooms in predefined assignments...")
+		}
+
+		dollarErrors := sch.ResolveDollarRooms(predefinedData.Assignments, schedule)
+		if len(dollarErrors) > 0 {
+			for _, err := range dollarErrors {
+				fmt.Fprintf(os.Stderr, "Room assignment error: %v\n", err)
+			}
+			os.Exit(1)
+		}
+
+		// Merge predefined assignments into the schedule
+		for _, pa := range predefinedData.Assignments {
+			// Resolve room IDs
+			theoryRoom := pa.ResolvedTheoryRoomID
+			if theoryRoom == "" || theoryRoom == "$" {
+				theoryRoom = "x"
+			}
+			labRoom := pa.ResolvedLabRoomID
+			if labRoom == "" || labRoom == "$" {
+				labRoom = "x"
+			}
+
+			// Build TheoryRoomIDs / LabRoomIDs for HC-13 validation
+			var theoryRoomIDs []string
+			var theoryRoomRaw string
+			if theoryRoom != "x" {
+				theoryRoomIDs = []string{theoryRoom}
+				theoryRoomRaw = theoryRoom
+			} else {
+				theoryRoomRaw = "x"
+			}
+
+			var labRoomIDs []string
+			var labRoomRaw string
+			if labRoom != "x" {
+				labRoomIDs = []string{labRoom}
+				labRoomRaw = labRoom
+			} else {
+				labRoomRaw = "x"
+			}
+
+			offering := &types.Offering{
+				CourseID:         pa.CourseID,
+				TheoryPeriods:    pa.TheoryPeriods,
+				LabPeriods:       pa.LabPeriods,
+				GroupIDs:         pa.GroupIDs,
+				GroupIDRaw:       pa.GroupIDRaw,
+				MainInstructorID: pa.MainInstructorID,
+				CoInstructorIDs:  pa.CoInstructorIDs,
+				CoInstructorRaw:  pa.CoInstructorRaw,
+				TheoryRoomIDs:    theoryRoomIDs,
+				TheoryRoomRaw:    theoryRoomRaw,
+				LabRoomIDs:       labRoomIDs,
+				LabRoomRaw:       labRoomRaw,
+			}
+
+			assignment := &types.Assignment{
+				Offering:     offering,
+				Day:          pa.Day,
+				TheoryStart:  pa.TheoryStart,
+				LabStart:     pa.LabStart,
+				TheoryRoomID: theoryRoom,
+				LabRoomID:    labRoom,
+			}
+			schedule.Assignments = append(schedule.Assignments, assignment)
+		}
 	}
 
 	// Step 5: Validate schedule against all hard constraints
@@ -111,13 +309,27 @@ func main() {
 	renderer := output.NewRenderer(parseResult.Config, schedule)
 	content := renderer.Render()
 
-	// Write output file
+	// Write timetable.md output file
 	if err := os.WriteFile(*outputPath, []byte(content), 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "Error writing output file: %v\n", err)
 		os.Exit(1)
 	}
-
 	fmt.Printf("Timetable written to %s\n", *outputPath)
+
+	// Write table.txt output file (raw data for pre-defined schedule)
+	if *verbose {
+		fmt.Println("Rendering table.txt...")
+	}
+
+	tableRenderer := output.NewTableRenderer(parseResult.Config, schedule)
+	tableContent := tableRenderer.Render()
+
+	tablePath := "table.txt"
+	if err := os.WriteFile(tablePath, []byte(tableContent), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "Error writing table file: %v\n", err)
+		os.Exit(1)
+	}
+	fmt.Printf("Table data written to %s\n", tablePath)
 }
 
 // printConfigFormat prints the config.conf file format documentation.

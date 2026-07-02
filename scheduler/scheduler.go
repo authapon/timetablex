@@ -13,10 +13,11 @@ import (
 
 // Scheduler holds the scheduling state.
 type Scheduler struct {
-	config   *types.Config
-	rng      *rand.Rand
-	attempts int
-	verbose  bool
+	config                *types.Config
+	rng                   *rand.Rand
+	attempts              int
+	verbose               bool
+	predefinedAssignments []*types.PredefinedAssignment
 }
 
 // NewScheduler creates a new scheduler.
@@ -25,11 +26,18 @@ func NewScheduler(config *types.Config, seed int64, attempts int, verbose bool) 
 		seed = time.Now().UnixNano()
 	}
 	return &Scheduler{
-		config:   config,
-		rng:      rand.New(rand.NewSource(seed)),
-		attempts: attempts,
-		verbose:  verbose,
+		config:                config,
+		rng:                   rand.New(rand.NewSource(seed)),
+		attempts:              attempts,
+		verbose:               verbose,
+		predefinedAssignments: nil,
 	}
+}
+
+// SetPredefinedAssignments sets the pre-defined assignments from config.txt.
+// These assignments' resources will be pre-booked so the scheduler avoids conflicts.
+func (s *Scheduler) SetPredefinedAssignments(assignments []*types.PredefinedAssignment) {
+	s.predefinedAssignments = assignments
 }
 
 type resourceKey struct {
@@ -68,6 +76,8 @@ func (s *Scheduler) Schedule() (*types.Schedule, error) {
 		}
 	}
 
+	s.log("  Pre-booking %d predefined assignments from config.txt...", len(s.predefinedAssignments))
+
 	// Build units with saturation degree info
 	units := make([]unit, len(s.config.Offerings))
 	for i, o := range s.config.Offerings {
@@ -85,6 +95,12 @@ func (s *Scheduler) Schedule() (*types.Schedule, error) {
 
 	// Try different lunch breaks (ordered by priority)
 	for _, lpVal := range s.config.Breaks.Periods {
+		// Skip this break period if any predefined assignment conflicts with it
+		if s.hasPredefinedBreakConflict(lpVal) {
+			s.log("  Skipping lunch break at period %d (conflicts with predefined assignment)", lpVal)
+			continue
+		}
+
 		lunchBreak := make(map[types.Day]int)
 		for _, day := range types.AllDays() {
 			lunchBreak[day] = lpVal
@@ -173,6 +189,7 @@ func (s *Scheduler) estimateDomainSize(o *types.Offering, total int, lunchBreak 
 				if !isTheory {
 					if o.MainInstructorID != "x" {
 						if s.isInstructorUnavailable(o.MainInstructorID, day, p) ||
+							s.isInstructorUnavailableMain(o.MainInstructorID, day, p) ||
 							s.isInstructorNoLate(o.MainInstructorID, day, start, total) {
 							ok = false
 							break
@@ -218,6 +235,64 @@ func (s *Scheduler) backtrackSchedule(units []unit, lunchBreak map[types.Day]int
 	instB := make(map[string]map[resourceKey]bool)
 	grpB := make(map[string]map[resourceKey]bool)
 	roomB := make(map[string]map[resourceKey]bool)
+
+	// Pre-book resources from predefined assignments (config.txt)
+	for _, pa := range s.predefinedAssignments {
+		totalPeriods := pa.TheoryPeriods + pa.LabPeriods
+		if totalPeriods == 0 {
+			continue
+		}
+		// Determine the correct start period (use TheoryStart; if 0, use LabStart)
+		startPeriod := pa.TheoryStart
+		if startPeriod == 0 {
+			startPeriod = pa.LabStart
+		}
+		for p := startPeriod; p < startPeriod+totalPeriods; p++ {
+			rk := resourceKey{day: pa.Day, period: p}
+			isLab := pa.LabStart > 0 && p >= pa.LabStart
+			isTheory := pa.TheoryStart > 0 && p >= pa.TheoryStart && p < pa.TheoryStart+pa.TheoryPeriods
+
+			// Book main instructor
+			if pa.MainInstructorID != "x" {
+				if instB[pa.MainInstructorID] == nil {
+					instB[pa.MainInstructorID] = make(map[resourceKey]bool)
+				}
+				instB[pa.MainInstructorID][rk] = true
+			}
+
+			// Book co-instructors (lab periods only)
+			if isLab {
+				for _, coID := range pa.CoInstructorIDs {
+					if instB[coID] == nil {
+						instB[coID] = make(map[resourceKey]bool)
+					}
+					instB[coID][rk] = true
+				}
+			}
+
+			// Book groups
+			for _, gid := range pa.GroupIDs {
+				if grpB[gid] == nil {
+					grpB[gid] = make(map[resourceKey]bool)
+				}
+				grpB[gid][rk] = true
+			}
+
+			// Book room (only if not "$" or "x")
+			var room string
+			if isTheory {
+				room = pa.TheoryRoomID
+			} else if isLab {
+				room = pa.LabRoomID
+			}
+			if room != "" && room != "x" && room != "$" {
+				if roomB[room] == nil {
+					roomB[room] = make(map[resourceKey]bool)
+				}
+				roomB[room][rk] = true
+			}
+		}
+	}
 
 	result := make([]innerAssignment, 0, n)
 	totalBacktracks := 0
@@ -412,6 +487,7 @@ func (s *Scheduler) genPositions(
 				if !isTheory {
 					if o.MainInstructorID != "x" {
 						if s.isInstructorUnavailable(o.MainInstructorID, day, p) ||
+							s.isInstructorUnavailableMain(o.MainInstructorID, day, p) ||
 							s.isInstructorNoLate(o.MainInstructorID, day, start, total) {
 							valid = false
 							break
@@ -913,6 +989,56 @@ func (s *Scheduler) randomShift(schedule *types.Schedule) ([]*types.Assignment, 
 	grpB := make(map[string]map[resourceKey]bool)
 	roomB := make(map[string]map[resourceKey]bool)
 
+	// Pre-book predefined assignments' resources so SA doesn't create conflicts
+	for _, pa := range s.predefinedAssignments {
+		totalPeriods := pa.TheoryPeriods + pa.LabPeriods
+		if totalPeriods == 0 {
+			continue
+		}
+		startPeriod := pa.TheoryStart
+		if startPeriod == 0 {
+			startPeriod = pa.LabStart
+		}
+		for p := startPeriod; p < startPeriod+totalPeriods; p++ {
+			rk := resourceKey{day: pa.Day, period: p}
+			isLab := pa.LabStart > 0 && p >= pa.LabStart
+			isTheory := pa.TheoryStart > 0 && p >= pa.TheoryStart && p < pa.TheoryStart+pa.TheoryPeriods
+
+			if pa.MainInstructorID != "x" {
+				if instB[pa.MainInstructorID] == nil {
+					instB[pa.MainInstructorID] = make(map[resourceKey]bool)
+				}
+				instB[pa.MainInstructorID][rk] = true
+			}
+			if isLab {
+				for _, coID := range pa.CoInstructorIDs {
+					if instB[coID] == nil {
+						instB[coID] = make(map[resourceKey]bool)
+					}
+					instB[coID][rk] = true
+				}
+			}
+			for _, gid := range pa.GroupIDs {
+				if grpB[gid] == nil {
+					grpB[gid] = make(map[resourceKey]bool)
+				}
+				grpB[gid][rk] = true
+			}
+			var rm string
+			if isTheory {
+				rm = pa.TheoryRoomID
+			} else if isLab {
+				rm = pa.LabRoomID
+			}
+			if rm != "" && rm != "x" && rm != "$" {
+				if roomB[rm] == nil {
+					roomB[rm] = make(map[resourceKey]bool)
+				}
+				roomB[rm][rk] = true
+			}
+		}
+	}
+
 	for _, ea := range rest {
 		for p := 1; p <= types.MaxPeriodsPerDay; p++ {
 			if !ea.ContainsPeriod(ea.Day, p) {
@@ -1091,6 +1217,10 @@ func (s *Scheduler) randomShift(schedule *types.Schedule) ([]*types.Assignment, 
 							allValid = false
 							break
 						}
+						if s.isInstructorUnavailableMain(o.MainInstructorID, day, p) {
+							allValid = false
+							break
+						}
 						if s.isInstructorNoLate(o.MainInstructorID, day, start, totalPeriods) {
 							allValid = false
 							break
@@ -1206,6 +1336,198 @@ func (s *Scheduler) calculateCost(sch *types.Schedule) float64 {
 	}
 
 	return cost
+}
+
+// ResolveDollarRooms resolves "$" rooms in predefined assignments after scheduling is complete.
+// For each predefined assignment with a "$" room field, it finds an available room from config.Rooms.
+// It considers all room bookings from scheduled assignments and other predefined (non-$) assignments.
+func (s *Scheduler) ResolveDollarRooms(predefined []*types.PredefinedAssignment, schedule *types.Schedule) []error {
+	var errors []error
+
+	// Build room booking map from all sources
+	roomB := make(map[string]map[resourceKey]bool)
+
+	// 1. Pre-book rooms from scheduled assignments
+	for _, a := range schedule.Assignments {
+		for p := 1; p <= types.MaxPeriodsPerDay; p++ {
+			if !a.ContainsPeriod(a.Day, p) {
+				continue
+			}
+			rk := resourceKey{day: a.Day, period: p}
+			if a.IsTheoryPeriod(p) {
+				rm := a.TheoryRoomID
+				if rm != "" && rm != "x" {
+					if roomB[rm] == nil {
+						roomB[rm] = make(map[resourceKey]bool)
+					}
+					roomB[rm][rk] = true
+				}
+			} else if a.IsLabPeriod(p) {
+				rm := a.LabRoomID
+				if rm != "" && rm != "x" {
+					if roomB[rm] == nil {
+						roomB[rm] = make(map[resourceKey]bool)
+					}
+					roomB[rm][rk] = true
+				}
+			}
+		}
+	}
+
+	// 2. Pre-book rooms from predefined assignments (non-$ rooms)
+	for _, pa := range predefined {
+		totalPeriods := pa.TheoryPeriods + pa.LabPeriods
+		if totalPeriods == 0 {
+			continue
+		}
+		// Determine the correct start period
+		startPeriod := pa.TheoryStart
+		if startPeriod == 0 {
+			startPeriod = pa.LabStart
+		}
+		for p := startPeriod; p < startPeriod+totalPeriods; p++ {
+			rk := resourceKey{day: pa.Day, period: p}
+			isLab := pa.LabStart > 0 && p >= pa.LabStart
+			isTheory := pa.TheoryStart > 0 && p >= pa.TheoryStart && p < pa.TheoryStart+pa.TheoryPeriods
+
+			var rm string
+			if isTheory {
+				rm = pa.TheoryRoomID
+			} else if isLab {
+				rm = pa.LabRoomID
+			}
+			if rm != "" && rm != "x" && rm != "$" {
+				if roomB[rm] == nil {
+					roomB[rm] = make(map[resourceKey]bool)
+				}
+				roomB[rm][rk] = true
+			}
+		}
+	}
+
+	// 3. Include rooms reserved by groups_unavailable
+	for _, gu := range s.config.GroupsUnavailable {
+		if gu.RoomID == "" || gu.RoomID == "none" {
+			continue
+		}
+		for p := gu.StartPeriod; p <= gu.EndPeriod; p++ {
+			rk := resourceKey{day: gu.Day, period: p}
+			if roomB[gu.RoomID] == nil {
+				roomB[gu.RoomID] = make(map[resourceKey]bool)
+			}
+			roomB[gu.RoomID][rk] = true
+		}
+	}
+
+	// 4. Include rooms reserved by instructor_unavailable
+	for _, iu := range s.config.InstructorUnavailable {
+		if iu.RoomID == "" || iu.RoomID == "none" {
+			continue
+		}
+		for p := iu.StartPeriod; p <= iu.EndPeriod; p++ {
+			rk := resourceKey{day: iu.Day, period: p}
+			if roomB[iu.RoomID] == nil {
+				roomB[iu.RoomID] = make(map[resourceKey]bool)
+			}
+			roomB[iu.RoomID][rk] = true
+		}
+	}
+
+	// 5. Resolve "$" rooms for each predefined assignment
+	for _, pa := range predefined {
+		// Initialize resolved IDs to current values
+		pa.ResolvedTheoryRoomID = pa.TheoryRoomID
+		pa.ResolvedLabRoomID = pa.LabRoomID
+
+		// Resolve theory room if $
+		if pa.TheoryRoomID == "$" && pa.TheoryPeriods > 0 {
+			roomID := s.findAvailableRoom(pa.Day, pa.TheoryStart, pa.TheoryStart+pa.TheoryPeriods-1, roomB)
+			if roomID == "" {
+				errors = append(errors, fmt.Errorf("cannot find available room for theory block of '%s' on %s periods %d-%d",
+					pa.CourseID, pa.Day, pa.TheoryStart, pa.TheoryStart+pa.TheoryPeriods-1))
+			} else {
+				pa.ResolvedTheoryRoomID = roomID
+				// Book the resolved room
+				for p := pa.TheoryStart; p < pa.TheoryStart+pa.TheoryPeriods; p++ {
+					rk := resourceKey{day: pa.Day, period: p}
+					if roomB[roomID] == nil {
+						roomB[roomID] = make(map[resourceKey]bool)
+					}
+					roomB[roomID][rk] = true
+				}
+				if s.verbose {
+					fmt.Printf("  Resolved $ theory room for '%s' on %s periods %d-%d -> %s\n",
+						pa.CourseID, pa.Day, pa.TheoryStart, pa.TheoryStart+pa.TheoryPeriods-1, roomID)
+				}
+			}
+		}
+
+		// Resolve lab room if $
+		if pa.LabRoomID == "$" && pa.LabPeriods > 0 {
+			roomID := s.findAvailableRoom(pa.Day, pa.LabStart, pa.LabStart+pa.LabPeriods-1, roomB)
+			if roomID == "" {
+				errors = append(errors, fmt.Errorf("cannot find available room for lab block of '%s' on %s periods %d-%d",
+					pa.CourseID, pa.Day, pa.LabStart, pa.LabStart+pa.LabPeriods-1))
+			} else {
+				pa.ResolvedLabRoomID = roomID
+				// Book the resolved room
+				for p := pa.LabStart; p < pa.LabStart+pa.LabPeriods; p++ {
+					rk := resourceKey{day: pa.Day, period: p}
+					if roomB[roomID] == nil {
+						roomB[roomID] = make(map[resourceKey]bool)
+					}
+					roomB[roomID][rk] = true
+				}
+				if s.verbose {
+					fmt.Printf("  Resolved $ lab room for '%s' on %s periods %d-%d -> %s\n",
+						pa.CourseID, pa.Day, pa.LabStart, pa.LabStart+pa.LabPeriods-1, roomID)
+				}
+			}
+		}
+	}
+
+	return errors
+}
+
+// findAvailableRoom finds an available room from config.Rooms for the given day and period range.
+func (s *Scheduler) findAvailableRoom(day types.Day, startPeriod, endPeriod int, roomB map[string]map[resourceKey]bool) string {
+	// Iterate through all rooms in config and find the first available one
+	for _, rm := range s.config.Rooms {
+		available := true
+		for p := startPeriod; p <= endPeriod; p++ {
+			rk := resourceKey{day: day, period: p}
+			if roomB[rm.ID] != nil && roomB[rm.ID][rk] {
+				available = false
+				break
+			}
+		}
+		if available {
+			return rm.ID
+		}
+	}
+	return ""
+}
+
+// hasPredefinedBreakConflict checks if any predefined assignment covers the given break period.
+// This prevents HC-12 violations by skipping break periods that conflict with predefined assignments.
+func (s *Scheduler) hasPredefinedBreakConflict(breakPeriod int) bool {
+	for _, pa := range s.predefinedAssignments {
+		if IsInPredefinedPeriod(pa, breakPeriod) {
+			return true
+		}
+	}
+	return false
+}
+
+// IsInPredefinedPeriod checks if the given period is covered by the predefined assignment.
+func IsInPredefinedPeriod(pa *types.PredefinedAssignment, period int) bool {
+	if pa.TheoryStart > 0 && period >= pa.TheoryStart && period < pa.TheoryStart+pa.TheoryPeriods {
+		return true
+	}
+	if pa.LabStart > 0 && period >= pa.LabStart && period < pa.LabStart+pa.LabPeriods {
+		return true
+	}
+	return false
 }
 
 func (s *Scheduler) log(format string, args ...interface{}) {

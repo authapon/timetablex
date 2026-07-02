@@ -243,5 +243,33 @@ type Schedule struct {
 	Config        *Config
 }
 
+// PredefinedAssignment represents a pre-defined schedule assignment from config.txt.
+type PredefinedAssignment struct {
+	LineNumber       int    // line number in config.txt
+	CourseID         string
+	TheoryPeriods    int
+	LabPeriods       int
+	GroupIDs         []string
+	GroupIDRaw       string
+	Day              Day
+	TheoryStart      int
+	LabStart         int
+	TheoryRoomID     string // "$" for auto-assign, "x" for none, or room ID
+	LabRoomID        string // "$" for auto-assign, "x" for none, or room ID
+	MainInstructorID string
+	CoInstructorIDs  []string
+	CoInstructorRaw  string
+	// Resolved rooms (after resolving "$")
+	ResolvedTheoryRoomID string
+	ResolvedLabRoomID    string
+}
+
+// PredefinedData holds all pre-defined schedule data parsed from config.txt.
+type PredefinedData struct {
+	Assignments            []*PredefinedAssignment
+	GroupsUnavailable      []*GroupUnavailable
+	InstructorUnavailable  []*InstructorUnavailable
+}
+
 // MaxPeriodsPerDay is the maximum number of periods in a day.
 const MaxPeriodsPerDay = 13
