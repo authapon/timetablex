@@ -191,34 +191,134 @@ func main() {
 		if *verbose {
 			fmt.Println("All offerings are predefined, creating empty schedule...")
 		}
-		lunchBreak := make(map[types.Day]int)
-		// Pick a break period that doesn't conflict with predefined assignments
+		instBreak := make(map[string]map[types.Day]int)
+		groupBreak := make(map[string]map[types.Day]int)
+		instPriority := make(map[string]map[types.Day]int)
+		groupPriority := make(map[string]map[types.Day]int)
+
+		// Build per-entity break maps, checking predefined conflicts and instructor/group unavailable periods
 		if len(parseResult.Config.Breaks.Periods) > 0 {
-			chosenBreak := 0
-			for _, bp := range parseResult.Config.Breaks.Periods {
-				hasConflict := false
-				for _, pa := range predefinedData.Assignments {
-					if scheduler.IsInPredefinedPeriod(pa, bp) {
-						hasConflict = true
+			// For each instructor, pick the best break period per day
+			for instID := range parseResult.Config.Instructors {
+				dayBreaks := make(map[types.Day]int)
+				dayPriorities := make(map[types.Day]int)
+				for _, day := range types.AllDays() {
+					// Check for full-day (1-13) unavailable - skip break entirely
+					hasFullDayUnavailable := false
+					for _, iu := range parseResult.Config.InstructorUnavailable {
+						if iu.InstructorID == instID && iu.Day == day && iu.StartPeriod == 1 && iu.EndPeriod == 13 {
+							hasFullDayUnavailable = true
+							break
+						}
+					}
+					if hasFullDayUnavailable {
+						dayBreaks[day] = 0
+						continue
+					}
+
+					found := false
+					for i, bp := range parseResult.Config.Breaks.Periods {
+						// Check predefined assignment conflict
+						hasConflict := false
+						for _, pa := range predefinedData.Assignments {
+							if scheduler.IsInPredefinedPeriod(pa, day, bp) {
+								hasConflict = true
+								break
+							}
+						}
+						if hasConflict {
+							continue
+						}
+
+						// Check instructor_unavailable
+						isUnavailable := false
+						for _, iu := range parseResult.Config.InstructorUnavailable {
+							if iu.InstructorID == instID && iu.Day == day && bp >= iu.StartPeriod && bp <= iu.EndPeriod {
+								isUnavailable = true
+								break
+							}
+						}
+						if isUnavailable {
+							continue
+						}
+
+						dayBreaks[day] = bp
+						dayPriorities[day] = i + 1
+						found = true
 						break
 					}
+					if !found {
+						dayBreaks[day] = 0
+					}
 				}
-				if !hasConflict {
-					chosenBreak = bp
-					break
+				instBreak[instID] = dayBreaks
+				instPriority[instID] = dayPriorities
+			}
+
+			// For each group, pick the best break period per day
+			for groupID := range parseResult.Config.Groups {
+				dayBreaks := make(map[types.Day]int)
+				dayPriorities := make(map[types.Day]int)
+				for _, day := range types.AllDays() {
+					// Check for full-day (1-13) unavailable - skip break entirely
+					hasFullDayUnavailable := false
+					for _, gu := range parseResult.Config.GroupsUnavailable {
+						if gu.GroupID == groupID && gu.Day == day && gu.StartPeriod == 1 && gu.EndPeriod == 13 {
+							hasFullDayUnavailable = true
+							break
+						}
+					}
+					if hasFullDayUnavailable {
+						dayBreaks[day] = 0
+						continue
+					}
+
+					found := false
+					for i, bp := range parseResult.Config.Breaks.Periods {
+						// Check predefined assignment conflict
+						hasConflict := false
+						for _, pa := range predefinedData.Assignments {
+							if scheduler.IsInPredefinedPeriod(pa, day, bp) {
+								hasConflict = true
+								break
+							}
+						}
+						if hasConflict {
+							continue
+						}
+
+						// Check groups_unavailable
+						isUnavailable := false
+						for _, gu := range parseResult.Config.GroupsUnavailable {
+							if gu.GroupID == groupID && gu.Day == day && bp >= gu.StartPeriod && bp <= gu.EndPeriod {
+								isUnavailable = true
+								break
+							}
+						}
+						if isUnavailable {
+							continue
+						}
+
+						dayBreaks[day] = bp
+						dayPriorities[day] = i + 1
+						found = true
+						break
+					}
+					if !found {
+						dayBreaks[day] = 0
+					}
 				}
-			}
-			if chosenBreak == 0 && len(parseResult.Config.Breaks.Periods) > 0 {
-				// All break periods conflict with predefined — just use the first
-				chosenBreak = parseResult.Config.Breaks.Periods[0]
-			}
-			for _, day := range types.AllDays() {
-				lunchBreak[day] = chosenBreak
+				groupBreak[groupID] = dayBreaks
+				groupPriority[groupID] = dayPriorities
 			}
 		}
+
 		schedule = &types.Schedule{
-			LunchBreakDay: lunchBreak,
-			Config:        parseResult.Config,
+			InstructorLunchBreak:    instBreak,
+			GroupLunchBreak:         groupBreak,
+			InstructorBreakPriority: instPriority,
+			GroupBreakPriority:      groupPriority,
+			Config:                  parseResult.Config,
 		}
 	}
 
@@ -678,11 +778,43 @@ func validateHardConstraints(config *types.Config, schedule *types.Schedule) []e
 		}
 	}
 
-	// HC-12: Lunch break - no assignments during break
-	for day, period := range schedule.LunchBreakDay {
-		for _, a := range schedule.Assignments {
-			if a.Day == day && a.ContainsPeriod(day, period) {
-				errors = append(errors, fmt.Errorf("HC-12: assignment on break period %d %s (%s)", period, day, a.Offering.CourseID))
+	// HC-12: Lunch break - no assignments during break (per-entity check)
+	// Check each assignment against involved entities' breaks
+	for _, a := range schedule.Assignments {
+		o := a.Offering
+		day := a.Day
+		for p := 1; p <= types.MaxPeriodsPerDay; p++ {
+			if !a.ContainsPeriod(day, p) {
+				continue
+			}
+			// Check main instructor's break
+			if o.MainInstructorID != "x" {
+				if dayBreaks, ok := schedule.InstructorLunchBreak[o.MainInstructorID]; ok {
+					if dayBreaks[day] == p {
+						errors = append(errors, fmt.Errorf("HC-12: assignment on break period %d %s for instructor '%s' (%s)",
+							p, day, o.MainInstructorID, o.CourseID))
+					}
+				}
+			}
+			// Check co-instructors' breaks (lab periods only)
+			if a.IsLabPeriod(p) {
+				for _, coID := range o.CoInstructorIDs {
+					if dayBreaks, ok := schedule.InstructorLunchBreak[coID]; ok {
+						if dayBreaks[day] == p {
+							errors = append(errors, fmt.Errorf("HC-12: assignment on break period %d %s for instructor '%s' (%s)",
+								p, day, coID, o.CourseID))
+						}
+					}
+				}
+			}
+			// Check groups' breaks
+			for _, gid := range o.GroupIDs {
+				if dayBreaks, ok := schedule.GroupLunchBreak[gid]; ok {
+					if dayBreaks[day] == p {
+						errors = append(errors, fmt.Errorf("HC-12: assignment on break period %d %s for group '%s' (%s)",
+							p, day, gid, o.CourseID))
+					}
+				}
 			}
 		}
 	}

@@ -68,50 +68,100 @@ type unit struct {
 func (s *Scheduler) Schedule() (*types.Schedule, error) {
 	s.log("Starting scheduling (backtracking construction)...")
 
-	lunchBreak := make(map[types.Day]int)
+	// Phase 1: Try with the optimal per-entity break map (highest priority per entity per day)
+	sch, err := s.trySchedule()
+	if err == nil {
+		return sch, nil
+	}
+
+	// Phase 2: Fallback - ใช้ break ที่มี priority ต่ำสุดสำหรับทุก entity (ยืดหยุ่นที่สุด)
+	s.log("  Optimal breaks not feasible, trying fallback with lowest-priority break...")
+
 	if len(s.config.Breaks.Periods) > 0 {
-		lp := s.config.Breaks.Periods[0]
-		for _, day := range types.AllDays() {
-			lunchBreak[day] = lp
+		// Build per-entity fallback breaks with lowest priority period,
+		// but skip periods that conflict with instructor/group unavailable
+		fallbackInstBreak := make(map[string]map[types.Day]int)
+		fallbackGroupBreak := make(map[string]map[types.Day]int)
+		fallbackInstPriority := make(map[string]map[types.Day]int)
+		fallbackGroupPriority := make(map[string]map[types.Day]int)
+
+		for instID := range s.config.Instructors {
+			dayBreaks := make(map[types.Day]int)
+			dayPriorities := make(map[types.Day]int)
+			for _, day := range types.AllDays() {
+				// If full-day unavailable, skip break
+				if s.hasFullDayInstructorUnavailable(instID, day) {
+					dayBreaks[day] = 0
+					continue
+				}
+				// Pick a break period that doesn't conflict with instructor_unavailable
+				found := false
+				for i := len(s.config.Breaks.Periods) - 1; i >= 0; i-- {
+					bp := s.config.Breaks.Periods[i]
+					if !s.hasPredefinedBreakConflictOnDay(bp, day) &&
+						!s.isInstructorUnavailable(instID, day, bp) {
+						dayBreaks[day] = bp
+						dayPriorities[day] = i + 1
+						found = true
+						break
+					}
+				}
+				if !found {
+					dayBreaks[day] = 0
+				}
+			}
+			fallbackInstBreak[instID] = dayBreaks
+			fallbackInstPriority[instID] = dayPriorities
 		}
-	}
-
-	s.log("  Pre-booking %d predefined assignments from config.txt...", len(s.predefinedAssignments))
-
-	// Build units with saturation degree info
-	units := make([]unit, len(s.config.Offerings))
-	for i, o := range s.config.Offerings {
-		total := o.TheoryPeriods + o.LabPeriods
-		u := unit{
-			offering:      o,
-			idx:           i,
-			theoryPeriods: o.TheoryPeriods,
-			labPeriods:    o.LabPeriods,
-			totalPeriods:  total,
-			domainSize:    s.estimateDomainSize(o, total, lunchBreak),
-		}
-		units[i] = u
-	}
-
-	// Try different lunch breaks (ordered by priority)
-	for _, lpVal := range s.config.Breaks.Periods {
-		// Skip this break period if any predefined assignment conflicts with it
-		if s.hasPredefinedBreakConflict(lpVal) {
-			s.log("  Skipping lunch break at period %d (conflicts with predefined assignment)", lpVal)
-			continue
-		}
-
-		lunchBreak := make(map[types.Day]int)
-		for _, day := range types.AllDays() {
-			lunchBreak[day] = lpVal
+		for groupID := range s.config.Groups {
+			dayBreaks := make(map[types.Day]int)
+			dayPriorities := make(map[types.Day]int)
+			for _, day := range types.AllDays() {
+				// If full-day unavailable, skip break
+				if s.hasFullDayGroupUnavailable(groupID, day) {
+					dayBreaks[day] = 0
+					continue
+				}
+				// Pick a break period that doesn't conflict with groups_unavailable
+				found := false
+				for i := len(s.config.Breaks.Periods) - 1; i >= 0; i-- {
+					bp := s.config.Breaks.Periods[i]
+					if !s.hasPredefinedBreakConflictOnDay(bp, day) &&
+						!s.isGroupUnavailable(groupID, day, bp) {
+						dayBreaks[day] = bp
+						dayPriorities[day] = i + 1
+						found = true
+						break
+					}
+				}
+				if !found {
+					dayBreaks[day] = 0
+				}
+			}
+			fallbackGroupBreak[groupID] = dayBreaks
+			fallbackGroupPriority[groupID] = dayPriorities
 		}
 
-		s.log("  Trying lunch break at period %d", lpVal)
+		s.log("  Fallback lunch break: built per-entity breaks avoiding unavailable periods")
 
-		maxBacktracks := len(units) * 50 // Limit total backtracks per attempt
+		units := make([]unit, len(s.config.Offerings))
+		for i, o := range s.config.Offerings {
+			total := o.TheoryPeriods + o.LabPeriods
+			u := unit{
+				offering:      o,
+				idx:           i,
+				theoryPeriods: o.TheoryPeriods,
+				labPeriods:    o.LabPeriods,
+				totalPeriods:  total,
+				domainSize:    s.estimateDomainSize(o, total, fallbackInstBreak, fallbackGroupBreak),
+			}
+			units[i] = u
+		}
+
+		maxBacktracks := len(units) * 50
 		for restart := 0; restart < s.attempts; restart++ {
 			if restart%10 == 0 {
-				s.log("  Attempt %d (lunch=%d)...", restart+1, lpVal)
+				s.log("  Fallback attempt %d...", restart+1)
 			}
 
 			s.rng.Shuffle(len(units), func(i, j int) { units[i], units[j] = units[j], units[i] })
@@ -119,13 +169,16 @@ func (s *Scheduler) Schedule() (*types.Schedule, error) {
 				return units[i].domainSize < units[j].domainSize
 			})
 
-			assignments, ok := s.backtrackSchedule(units, lunchBreak, maxBacktracks)
+			assignments, ok := s.backtrackSchedule(units, fallbackInstBreak, fallbackGroupBreak, maxBacktracks)
 			if ok && len(assignments) == len(units) {
-				s.log("  Found feasible solution on attempt %d with lunch at period %d", restart+1, lpVal)
+				s.log("  Found feasible solution on fallback attempt %d", restart+1)
 
 				sch := &types.Schedule{
-					LunchBreakDay: lunchBreak,
-					Config:        s.config,
+					InstructorLunchBreak:     fallbackInstBreak,
+					GroupLunchBreak:          fallbackGroupBreak,
+					InstructorBreakPriority:  fallbackInstPriority,
+					GroupBreakPriority:       fallbackGroupPriority,
+					Config:                   s.config,
 				}
 				for _, a := range assignments {
 					sch.Assignments = append(sch.Assignments, &types.Assignment{
@@ -140,6 +193,14 @@ func (s *Scheduler) Schedule() (*types.Schedule, error) {
 
 				s.log("Phase 2: Simulated Annealing")
 				s.simulatedAnnealing(sch)
+
+				// Phase 3: พยายาม upgrade break period ของแต่ละ entity ไปเป็นที่มี priority สูงกว่าทีละ entity
+				s.log("Phase 3: Attempting per-entity break upgrade to higher-priority periods...")
+				upgraded := s.tryUpgradeEntityBreaks(sch)
+				if upgraded {
+					s.log("  Successfully upgraded at least one entity's break to higher-priority period!")
+				}
+
 				return sch, nil
 			}
 		}
@@ -148,9 +209,241 @@ func (s *Scheduler) Schedule() (*types.Schedule, error) {
 	return nil, fmt.Errorf("unable to find feasible schedule after %d attempts", s.attempts)
 }
 
+// trySchedule attempts to schedule with the optimal per-entity break map.
+func (s *Scheduler) trySchedule() (*types.Schedule, error) {
+	// Build per-entity lunch break map: for each entity independently pick the best
+	// available break period (highest priority that doesn't conflict with predefined)
+	instBreak, groupBreak := s.buildEntityBreaks()
+	instPriority, groupPriority := s.buildEntityBreakPriorities(instBreak, groupBreak)
+	s.logEntityBreaks(instBreak, groupBreak)
+
+	s.log("  Pre-booking %d predefined assignments from config.txt...", len(s.predefinedAssignments))
+
+	// Build units with saturation degree info
+	units := make([]unit, len(s.config.Offerings))
+	for i, o := range s.config.Offerings {
+		total := o.TheoryPeriods + o.LabPeriods
+		u := unit{
+			offering:      o,
+			idx:           i,
+			theoryPeriods: o.TheoryPeriods,
+			labPeriods:    o.LabPeriods,
+			totalPeriods:  total,
+			domainSize:    s.estimateDomainSize(o, total, instBreak, groupBreak),
+		}
+		units[i] = u
+	}
+
+	maxBacktracks := len(units) * 50 // Limit total backtracks per attempt
+	for restart := 0; restart < s.attempts; restart++ {
+		if restart%10 == 0 {
+			s.log("  Attempt %d...", restart+1)
+		}
+
+		s.rng.Shuffle(len(units), func(i, j int) { units[i], units[j] = units[j], units[i] })
+		sort.SliceStable(units, func(i, j int) bool {
+			return units[i].domainSize < units[j].domainSize
+		})
+
+		assignments, ok := s.backtrackSchedule(units, instBreak, groupBreak, maxBacktracks)
+		if ok && len(assignments) == len(units) {
+			s.log("  Found feasible solution on attempt %d", restart+1)
+
+			sch := &types.Schedule{
+				InstructorLunchBreak:     instBreak,
+				GroupLunchBreak:          groupBreak,
+				InstructorBreakPriority:  instPriority,
+				GroupBreakPriority:       groupPriority,
+				Config:                   s.config,
+			}
+			for _, a := range assignments {
+				sch.Assignments = append(sch.Assignments, &types.Assignment{
+					Offering:     a.offering,
+					Day:          a.day,
+					TheoryStart:  a.theoryStart,
+					LabStart:     a.labStart,
+					TheoryRoomID: a.theoryRoom,
+					LabRoomID:    a.labRoom,
+				})
+			}
+
+			s.log("Phase 2: Simulated Annealing")
+			s.simulatedAnnealing(sch)
+
+			// Phase 3: พยายาม upgrade break period ของแต่ละ entity ไปเป็นที่มี priority สูงกว่า
+			// โดยตรวจสอบว่าการย้าย break ไปยัง period ที่มี priority สูงกว่าจะทำให้เกิด conflict หรือไม่
+			s.log("Phase 3: Attempting per-entity break upgrade to higher-priority periods...")
+			upgraded := s.tryUpgradeEntityBreaks(sch)
+			if upgraded {
+				s.log("  Successfully upgraded at least one entity's break to higher-priority period!")
+			}
+
+			return sch, nil
+		}
+	}
+
+	return nil, fmt.Errorf("unable to find feasible schedule with optimal breaks")
+}
+
+// buildEntityBreaks builds per-entity lunch break maps by picking the best available
+// break period (highest priority) for each entity independently, considering predefined
+// assignment conflicts and instructor/group unavailable periods on that specific day.
+func (s *Scheduler) buildEntityBreaks() (map[string]map[types.Day]int, map[string]map[types.Day]int) {
+	instBreak := make(map[string]map[types.Day]int)
+	groupBreak := make(map[string]map[types.Day]int)
+
+	if len(s.config.Breaks.Periods) == 0 {
+		return instBreak, groupBreak
+	}
+
+	// Build for each instructor
+	for instID := range s.config.Instructors {
+		dayBreaks := make(map[types.Day]int)
+		for _, day := range types.AllDays() {
+			// If the instructor has full-day (1-13) unavailable, skip break entirely
+			if s.hasFullDayInstructorUnavailable(instID, day) {
+				dayBreaks[day] = 0
+				continue
+			}
+			found := false
+			for _, bp := range s.config.Breaks.Periods {
+				if !s.hasPredefinedBreakConflictOnDay(bp, day) &&
+					!s.isInstructorUnavailable(instID, day, bp) {
+					dayBreaks[day] = bp
+					found = true
+					break
+				}
+			}
+			if !found {
+				dayBreaks[day] = 0
+			}
+		}
+		instBreak[instID] = dayBreaks
+	}
+
+	// Build for each group
+	for groupID := range s.config.Groups {
+		dayBreaks := make(map[types.Day]int)
+		for _, day := range types.AllDays() {
+			// If the group has full-day (1-13) unavailable, skip break entirely
+			if s.hasFullDayGroupUnavailable(groupID, day) {
+				dayBreaks[day] = 0
+				continue
+			}
+			found := false
+			for _, bp := range s.config.Breaks.Periods {
+				if !s.hasPredefinedBreakConflictOnDay(bp, day) &&
+					!s.isGroupUnavailable(groupID, day, bp) {
+					dayBreaks[day] = bp
+					found = true
+					break
+				}
+			}
+			if !found {
+				dayBreaks[day] = 0
+			}
+		}
+		groupBreak[groupID] = dayBreaks
+	}
+
+	return instBreak, groupBreak
+}
+
+// buildEntityBreakPriorities builds priority maps from break maps.
+func (s *Scheduler) buildEntityBreakPriorities(
+	instBreak map[string]map[types.Day]int,
+	groupBreak map[string]map[types.Day]int,
+) (map[string]map[types.Day]int, map[string]map[types.Day]int) {
+	instPriority := make(map[string]map[types.Day]int)
+	groupPriority := make(map[string]map[types.Day]int)
+
+	for instID, dayBreaks := range instBreak {
+		pri := make(map[types.Day]int)
+		for day, bp := range dayBreaks {
+			if bp > 0 {
+				for i, p := range s.config.Breaks.Periods {
+					if p == bp {
+						pri[day] = i + 1
+						break
+					}
+				}
+			}
+		}
+		instPriority[instID] = pri
+	}
+
+	for groupID, dayBreaks := range groupBreak {
+		pri := make(map[types.Day]int)
+		for day, bp := range dayBreaks {
+			if bp > 0 {
+				for i, p := range s.config.Breaks.Periods {
+					if p == bp {
+						pri[day] = i + 1
+						break
+					}
+				}
+			}
+		}
+		groupPriority[groupID] = pri
+	}
+
+	return instPriority, groupPriority
+}
+
+// hasFullDayInstructorUnavailable checks if an instructor has a full-day (1-13) unavailable entry on the given day.
+func (s *Scheduler) hasFullDayInstructorUnavailable(instID string, day types.Day) bool {
+	for _, iu := range s.config.InstructorUnavailable {
+		if iu.InstructorID == instID && iu.Day == day && iu.StartPeriod == 1 && iu.EndPeriod == 13 {
+			return true
+		}
+	}
+	return false
+}
+
+// hasFullDayGroupUnavailable checks if a group has a full-day (1-13) unavailable entry on the given day.
+func (s *Scheduler) hasFullDayGroupUnavailable(groupID string, day types.Day) bool {
+	for _, gu := range s.config.GroupsUnavailable {
+		if gu.GroupID == groupID && gu.Day == day && gu.StartPeriod == 1 && gu.EndPeriod == 13 {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *Scheduler) logEntityBreaks(instBreak map[string]map[types.Day]int, groupBreak map[string]map[types.Day]int) {
+	s.log("  Lunch break by entity (sample):")
+	// Sample a few instructors
+	count := 0
+	for instID, dayBreaks := range instBreak {
+		if count >= 3 {
+			break
+		}
+		for _, day := range types.AllDays() {
+			if bp, ok := dayBreaks[day]; ok && bp > 0 {
+				s.log("    Instructor %s %s: period %d", instID, day, bp)
+			}
+		}
+		count++
+	}
+	// Sample a few groups
+	count = 0
+	for groupID, dayBreaks := range groupBreak {
+		if count >= 3 {
+			break
+		}
+		for _, day := range types.AllDays() {
+			if bp, ok := dayBreaks[day]; ok && bp > 0 {
+				s.log("    Group %s %s: period %d", groupID, day, bp)
+			}
+		}
+		count++
+	}
+}
+
 // estimateDomainSize counts how many (day, start) positions pass static constraints
 // for this offering.
-func (s *Scheduler) estimateDomainSize(o *types.Offering, total int, lunchBreak map[types.Day]int) int {
+func (s *Scheduler) estimateDomainSize(o *types.Offering, total int,
+	instBreak map[string]map[types.Day]int, groupBreak map[string]map[types.Day]int) int {
 	count := 0
 	for _, day := range types.AllDays() {
 		if !s.isDayValidForGroups(o.GroupIDs, day) {
@@ -160,9 +453,9 @@ func (s *Scheduler) estimateDomainSize(o *types.Offering, total int, lunchBreak 
 		if maxStart < 1 {
 			continue
 		}
-		lp := lunchBreak[day]
 		for start := 1; start <= maxStart; start++ {
-			if lp > 0 && start <= lp && lp <= start+total-1 {
+			// Check per-entity break conflicts
+			if hasBreakConflict(o, day, start, total, o.TheoryPeriods, instBreak, groupBreak) {
 				continue
 			}
 			// Check static constraints quickly
@@ -226,7 +519,10 @@ type pos struct {
 // It generates positions dynamically (considering current resource state)
 // and backtracks when a unit can't be placed. maxBacktracks limits the total
 // number of backtrack operations to bound runtime.
-func (s *Scheduler) backtrackSchedule(units []unit, lunchBreak map[types.Day]int, maxBacktracks int) ([]innerAssignment, bool) {
+func (s *Scheduler) backtrackSchedule(units []unit,
+	instBreak map[string]map[types.Day]int,
+	groupBreak map[string]map[types.Day]int,
+	maxBacktracks int) ([]innerAssignment, bool) {
 	n := len(units)
 	if n == 0 {
 		return nil, true
@@ -307,7 +603,7 @@ func (s *Scheduler) backtrackSchedule(units []unit, lunchBreak map[types.Day]int
 	stack := make([]state, 0, n+1)
 
 	// Push initial unit
-	curPositions := s.genPositions(units[0], lunchBreak, instB, grpB, roomB)
+	curPositions := s.genPositions(units[0], instBreak, groupBreak, instB, grpB, roomB)
 	stack = append(stack, state{unitIdx: 0, posIndex: 0, positions: curPositions})
 
 	for len(stack) > 0 {
@@ -409,7 +705,7 @@ func (s *Scheduler) backtrackSchedule(units []unit, lunchBreak map[types.Day]int
 				break
 			}
 
-			nextPositions := s.genPositions(units[top.unitIdx+1], lunchBreak, instB, grpB, roomB)
+			nextPositions := s.genPositions(units[top.unitIdx+1], instBreak, groupBreak, instB, grpB, roomB)
 			stack = append(stack, state{unitIdx: top.unitIdx + 1, posIndex: 0, positions: nextPositions})
 			found = true
 			break
@@ -440,7 +736,8 @@ func (s *Scheduler) backtrackSchedule(units []unit, lunchBreak map[types.Day]int
 // Returns positions sorted by heuristic quality.
 func (s *Scheduler) genPositions(
 	u unit,
-	lunchBreak map[types.Day]int,
+	instBreak map[string]map[types.Day]int,
+	groupBreak map[string]map[types.Day]int,
 	instB map[string]map[resourceKey]bool,
 	grpB map[string]map[resourceKey]bool,
 	roomB map[string]map[resourceKey]bool,
@@ -457,9 +754,9 @@ func (s *Scheduler) genPositions(
 		if maxStart < 1 {
 			continue
 		}
-		lp := lunchBreak[day]
 		for start := 1; start <= maxStart; start++ {
-			if lp > 0 && start <= lp && lp <= start+total-1 {
+			// Check per-entity break conflicts
+			if hasBreakConflict(o, day, start, total, u.theoryPeriods, instBreak, groupBreak) {
 				continue
 			}
 
@@ -720,6 +1017,48 @@ func (s *Scheduler) unbookResources(
 	}
 }
 
+// hasBreakConflict checks if any entity involved in an offering has a lunch break
+// that overlaps with the given position (day, start, total periods).
+func hasBreakConflict(
+	o *types.Offering,
+	day types.Day,
+	start int,
+	total int,
+	theoryPeriods int,
+	instBreak map[string]map[types.Day]int,
+	groupBreak map[string]map[types.Day]int,
+) bool {
+	// Check main instructor's break
+	if o.MainInstructorID != "x" {
+		if dayBreaks, ok := instBreak[o.MainInstructorID]; ok {
+			if bp, ok2 := dayBreaks[day]; ok2 && bp > 0 && start <= bp && bp < start+total {
+				return true
+			}
+		}
+	}
+
+	// Check groups' breaks
+	for _, gid := range o.GroupIDs {
+		if dayBreaks, ok := groupBreak[gid]; ok {
+			if bp, ok2 := dayBreaks[day]; ok2 && bp > 0 && start <= bp && bp < start+total {
+				return true
+			}
+		}
+	}
+
+	// Check co-instructors' breaks (only during lab periods)
+	labStart := start + theoryPeriods
+	for _, coID := range o.CoInstructorIDs {
+		if dayBreaks, ok := instBreak[coID]; ok {
+			if bp, ok2 := dayBreaks[day]; ok2 && bp > 0 && bp >= labStart && bp < start+total {
+				return true
+			}
+		}
+	}
+
+	return false
+}
+
 // verifySchedule checks that the solution satisfies all hard constraints.
 func (s *Scheduler) verifySchedule(assignments []innerAssignment) bool {
 	// HC-1: No double-booking of instructors
@@ -958,6 +1297,137 @@ func (s *Scheduler) simulatedAnnealing(schedule *types.Schedule) {
 	s.log("  Final cost: %.2f", bestCost)
 }
 
+// tryUpgradeEntityBreaks attempts to upgrade each entity's break to a higher-priority period.
+// For each entity that has a lower-priority break, it checks if the higher-priority period
+// would conflict with any assignment that entity is involved in.
+func (s *Scheduler) tryUpgradeEntityBreaks(schedule *types.Schedule) bool {
+	upgraded := false
+
+	// Helper: for a given entity and day, try to upgrade their break
+	tryUpgrade := func(entityType string, entityID string, day types.Day,
+		breakMap map[string]map[types.Day]int,
+		priorityMap map[string]map[types.Day]int) {
+
+		currentBreak := 0
+		if dayBreaks, ok := breakMap[entityID]; ok {
+			currentBreak = dayBreaks[day]
+		}
+		if currentBreak == 0 {
+			return
+		}
+
+		// หา higher-priority break periods ที่มี priority สูงกว่า current break
+		var higherBreaks []int
+		for _, bp := range s.config.Breaks.Periods {
+			if bp == currentBreak {
+				break
+			}
+			higherBreaks = append(higherBreaks, bp)
+		}
+
+		if len(higherBreaks) == 0 {
+			return
+		}
+
+		// ลอง upgrade ไปยัง higher-priority break ที่ compatible สำหรับ entity นี้
+		for _, bp := range higherBreaks {
+			if s.hasPredefinedBreakConflictOnDay(bp, day) {
+				continue
+			}
+
+			// ข้าม break period ที่อยู่ใน instructor_unavailable หรือ groups_unavailable
+			if entityType == "instructor" && s.isInstructorUnavailable(entityID, day, bp) {
+				continue
+			}
+			if entityType == "group" && s.isGroupUnavailable(entityID, day, bp) {
+				continue
+			}
+
+			// ตรวจสอบว่า entity นี้มี assignment ใดที่ overlap กับ break period นี้ในวันนี้หรือไม่
+			compatible := true
+			for _, a := range schedule.Assignments {
+				if a.Day != day {
+					continue
+				}
+				if !a.ContainsPeriod(day, bp) {
+					continue
+				}
+
+				// Check if this entity is involved in this assignment
+				if entityType == "instructor" {
+					if a.Offering.MainInstructorID == entityID {
+						compatible = false
+						break
+					}
+					for _, coID := range a.Offering.CoInstructorIDs {
+						if coID == entityID {
+							compatible = false
+							break
+						}
+					}
+				} else if entityType == "group" {
+					for _, gid := range a.Offering.GroupIDs {
+						if gid == entityID {
+							compatible = false
+							break
+						}
+					}
+					if !compatible {
+						break
+					}
+				}
+				if !compatible {
+					break
+				}
+			}
+
+			if compatible {
+				// Upgrade! เปลี่ยน lunch break entity นี้เป็น period นี้
+				if breakMap[entityID] == nil {
+					breakMap[entityID] = make(map[types.Day]int)
+				}
+				breakMap[entityID][day] = bp
+
+				// Update priority
+				for i, p := range s.config.Breaks.Periods {
+					if p == bp {
+						if priorityMap[entityID] == nil {
+							priorityMap[entityID] = make(map[types.Day]int)
+						}
+						priorityMap[entityID][day] = i + 1
+						break
+					}
+				}
+
+				s.log("  Upgraded %s %s %s break from period %d to %d",
+					entityType, entityID, day, currentBreak, bp)
+				upgraded = true
+				break
+			}
+		}
+	}
+
+	// Try upgrade each instructor
+	for instID := range schedule.InstructorLunchBreak {
+		for _, day := range types.AllDays() {
+			tryUpgrade("instructor", instID, day,
+				schedule.InstructorLunchBreak,
+				schedule.InstructorBreakPriority)
+		}
+	}
+
+	// Try upgrade each group
+	for groupID := range schedule.GroupLunchBreak {
+		for _, day := range types.AllDays() {
+			tryUpgrade("group", groupID, day,
+				schedule.GroupLunchBreak,
+				schedule.GroupBreakPriority)
+		}
+	}
+
+	return upgraded
+}
+
 func copyAssignments(a []*types.Assignment) []*types.Assignment {
 	r := make([]*types.Assignment, len(a))
 	for i, v := range a {
@@ -1104,10 +1574,10 @@ func (s *Scheduler) randomShift(schedule *types.Schedule) ([]*types.Assignment, 
 		for _, start := range starts {
 			end := start + totalPeriods - 1
 
-			if lp, ok := schedule.LunchBreakDay[day]; ok {
-				if start <= lp && lp <= end {
-					continue
-				}
+			// Check per-entity break conflicts for this offering
+			if hasBreakConflict(o, day, start, totalPeriods, o.TheoryPeriods,
+				schedule.InstructorLunchBreak, schedule.GroupLunchBreak) {
+				continue
 			}
 
 			theoryRoom := "x"
@@ -1269,6 +1739,25 @@ func (s *Scheduler) randomShift(schedule *types.Schedule) ([]*types.Assignment, 
 
 func (s *Scheduler) calculateCost(sch *types.Schedule) float64 {
 	cost := 0.0
+
+	// Penalty สำหรับการใช้ break period ที่มี priority ต่ำกว่าสำหรับแต่ละ entity
+	// priority = 1 คือดีที่สุด (highest priority)
+	// รวม penalty ของ instructors
+	for instID := range sch.InstructorBreakPriority {
+		for _, day := range types.AllDays() {
+			if pri, ok := sch.InstructorBreakPriority[instID][day]; ok && pri > 1 {
+				cost += float64(pri-1) * 100.0
+			}
+		}
+	}
+	// รวม penalty ของ groups
+	for groupID := range sch.GroupBreakPriority {
+		for _, day := range types.AllDays() {
+			if pri, ok := sch.GroupBreakPriority[groupID][day]; ok && pri > 1 {
+				cost += float64(pri-1) * 100.0
+			}
+		}
+	}
 
 	for _, a := range sch.Assignments {
 		o := a.Offering
@@ -1508,19 +1997,23 @@ func (s *Scheduler) findAvailableRoom(day types.Day, startPeriod, endPeriod int,
 	return ""
 }
 
-// hasPredefinedBreakConflict checks if any predefined assignment covers the given break period.
-// This prevents HC-12 violations by skipping break periods that conflict with predefined assignments.
-func (s *Scheduler) hasPredefinedBreakConflict(breakPeriod int) bool {
+// hasPredefinedBreakConflictOnDay checks if any predefined assignment covers the given break period
+// on the specified day. This enables per-day break period selection.
+func (s *Scheduler) hasPredefinedBreakConflictOnDay(breakPeriod int, day types.Day) bool {
 	for _, pa := range s.predefinedAssignments {
-		if IsInPredefinedPeriod(pa, breakPeriod) {
+		if IsInPredefinedPeriod(pa, day, breakPeriod) {
 			return true
 		}
 	}
 	return false
 }
 
-// IsInPredefinedPeriod checks if the given period is covered by the predefined assignment.
-func IsInPredefinedPeriod(pa *types.PredefinedAssignment, period int) bool {
+// IsInPredefinedPeriod checks if the given period on the specified day is covered
+// by the predefined assignment.
+func IsInPredefinedPeriod(pa *types.PredefinedAssignment, day types.Day, period int) bool {
+	if pa.Day != day {
+		return false
+	}
 	if pa.TheoryStart > 0 && period >= pa.TheoryStart && period < pa.TheoryStart+pa.TheoryPeriods {
 		return true
 	}

@@ -238,9 +238,14 @@ func (a *Assignment) String() string {
 
 // Schedule holds all assignments and the lunch break selection.
 type Schedule struct {
-	Assignments   []*Assignment
-	LunchBreakDay map[Day]int // day -> lunch break period number
-	Config        *Config
+	Assignments []*Assignment
+	// Per-entity lunch break: each instructor and group can have their own break period per day.
+	InstructorLunchBreak map[string]map[Day]int // instructorID -> day -> lunch break period number
+	GroupLunchBreak      map[string]map[Day]int // groupID -> day -> lunch break period number
+	// Per-entity lunch break priority: priority = 1 (highest), higher number = lower priority
+	InstructorBreakPriority map[string]map[Day]int // instructorID -> day -> priority (1 = highest)
+	GroupBreakPriority      map[string]map[Day]int // groupID -> day -> priority (1 = highest)
+	Config                 *Config
 }
 
 // PredefinedAssignment represents a pre-defined schedule assignment from config.txt.

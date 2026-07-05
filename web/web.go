@@ -322,13 +322,18 @@ func runScheduling(configPath, predefinedPath string, attempts int) (mdContent, 
 			return "", "", fmt.Sprintf("Error: %v", err)
 		}
 	} else if hasPredefined {
-		lunchBreak := make(map[types.Day]int)
+		instBreak := make(map[string]map[types.Day]int)
+		groupBreak := make(map[string]map[types.Day]int)
+		instPriority := make(map[string]map[types.Day]int)
+		groupPriority := make(map[string]map[types.Day]int)
+
 		if len(parseResult.Config.Breaks.Periods) > 0 {
 			chosenBreak := 0
+			breakPriority := 1
 			for _, bp := range parseResult.Config.Breaks.Periods {
 				hasConflict := false
 				for _, pa := range predefinedData.Assignments {
-					if scheduler.IsInPredefinedPeriod(pa, bp) {
+					if scheduler.IsInPredefinedPeriod(pa, pa.Day, bp) {
 						hasConflict = true
 						break
 					}
@@ -341,13 +346,41 @@ func runScheduling(configPath, predefinedPath string, attempts int) (mdContent, 
 			if chosenBreak == 0 && len(parseResult.Config.Breaks.Periods) > 0 {
 				chosenBreak = parseResult.Config.Breaks.Periods[0]
 			}
-			for _, day := range types.AllDays() {
-				lunchBreak[day] = chosenBreak
+			for i, bp := range parseResult.Config.Breaks.Periods {
+				if bp == chosenBreak {
+					breakPriority = i + 1
+					break
+				}
+			}
+
+			for instID := range parseResult.Config.Instructors {
+				dayBreaks := make(map[types.Day]int)
+				dayPriorities := make(map[types.Day]int)
+				for _, day := range types.AllDays() {
+					dayBreaks[day] = chosenBreak
+					dayPriorities[day] = breakPriority
+				}
+				instBreak[instID] = dayBreaks
+				instPriority[instID] = dayPriorities
+			}
+			for groupID := range parseResult.Config.Groups {
+				dayBreaks := make(map[types.Day]int)
+				dayPriorities := make(map[types.Day]int)
+				for _, day := range types.AllDays() {
+					dayBreaks[day] = chosenBreak
+					dayPriorities[day] = breakPriority
+				}
+				groupBreak[groupID] = dayBreaks
+				groupPriority[groupID] = dayPriorities
 			}
 		}
+
 		schedule = &types.Schedule{
-			LunchBreakDay: lunchBreak,
-			Config:        parseResult.Config,
+			InstructorLunchBreak:    instBreak,
+			GroupLunchBreak:         groupBreak,
+			InstructorBreakPriority: instPriority,
+			GroupBreakPriority:      groupPriority,
+			Config:                  parseResult.Config,
 		}
 	}
 
@@ -675,11 +708,42 @@ func validateHardConstraints(config *types.Config, schedule *types.Schedule) []e
 		}
 	}
 
-	// HC-12: Lunch break - no assignments during break
-	for day, period := range schedule.LunchBreakDay {
-		for _, a := range schedule.Assignments {
-			if a.Day == day && a.ContainsPeriod(day, period) {
-				errors = append(errors, fmt.Errorf("HC-12: assignment on break period %d %s (%s)", period, day, a.Offering.CourseID))
+	// HC-12: Lunch break - no assignments during break (per-entity check)
+	for _, a := range schedule.Assignments {
+		o := a.Offering
+		day := a.Day
+		for p := 1; p <= types.MaxPeriodsPerDay; p++ {
+			if !a.ContainsPeriod(day, p) {
+				continue
+			}
+			// Check main instructor's break
+			if o.MainInstructorID != "x" {
+				if dayBreaks, ok := schedule.InstructorLunchBreak[o.MainInstructorID]; ok {
+					if dayBreaks[day] == p {
+						errors = append(errors, fmt.Errorf("HC-12: assignment on break period %d %s for instructor '%s' (%s)",
+							p, day, o.MainInstructorID, o.CourseID))
+					}
+				}
+			}
+			// Check co-instructors' breaks (lab periods only)
+			if a.IsLabPeriod(p) {
+				for _, coID := range o.CoInstructorIDs {
+					if dayBreaks, ok := schedule.InstructorLunchBreak[coID]; ok {
+						if dayBreaks[day] == p {
+							errors = append(errors, fmt.Errorf("HC-12: assignment on break period %d %s for instructor '%s' (%s)",
+								p, day, coID, o.CourseID))
+						}
+					}
+				}
+			}
+			// Check groups' breaks
+			for _, gid := range o.GroupIDs {
+				if dayBreaks, ok := schedule.GroupLunchBreak[gid]; ok {
+					if dayBreaks[day] == p {
+						errors = append(errors, fmt.Errorf("HC-12: assignment on break period %d %s for group '%s' (%s)",
+							p, day, gid, o.CourseID))
+					}
+				}
 			}
 		}
 	}

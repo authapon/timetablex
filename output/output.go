@@ -533,9 +533,13 @@ func (r *TimetableRenderer) mergeInstructorPeriods(periods []*periodEntry, unava
 	}
 
 	// Add lunch break entry (overrides unavailable entries for the lunch period)
-	// Exceptions: do not force lunch break if the day has full-day (1-13) instructor_unavailable
+	// Use per-instructor break
 	if r.schedule != nil {
-		if lp, ok := r.schedule.LunchBreakDay[day]; ok && lp > 0 {
+		lp := 0
+		if dayBreaks, ok := r.schedule.InstructorLunchBreak[instructorID]; ok {
+			lp = dayBreaks[day]
+		}
+		if lp > 0 {
 			hasFullDayUnavailable := false
 			for _, iu := range r.config.InstructorUnavailable {
 				if iu.InstructorID == instructorID && iu.Day == day && iu.StartPeriod == 1 && iu.EndPeriod == 13 {
@@ -666,9 +670,13 @@ func (r *TimetableRenderer) buildGroupPeriodEntries(groupID string, day types.Da
 	}
 
 	// Add lunch break entry (overrides unavailable entries for the lunch period)
-	// Exceptions: do not force lunch break if the day has full-day (1-13) groups_unavailable
+	// Use per-group break
 	if r.schedule != nil {
-		if lp, ok := r.schedule.LunchBreakDay[day]; ok && lp > 0 {
+		lp := 0
+		if dayBreaks, ok := r.schedule.GroupLunchBreak[groupID]; ok {
+			lp = dayBreaks[day]
+		}
+		if lp > 0 {
 			hasFullDayUnavailable := false
 			for _, gu := range r.config.GroupsUnavailable {
 				if gu.GroupID == groupID && gu.Day == day && gu.StartPeriod == 1 && gu.EndPeriod == 13 {
