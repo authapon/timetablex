@@ -169,7 +169,7 @@ func checkFeasibilityPreliminary(config *types.Config) []ValidationError {
 		}
 	}
 
-	// Maximum available periods per day per instructor = 13 (minus unavailable periods and break)
+	// Maximum available periods per day per instructor = 15 (minus unavailable periods and break)
 	maxPeriodsPerWeek := len(types.AllDays()) * types.MaxPeriodsPerDay
 
 	for _, inst := range config.Instructors {

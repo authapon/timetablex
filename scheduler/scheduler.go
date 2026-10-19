@@ -18,6 +18,11 @@ type Scheduler struct {
 	attempts              int
 	verbose               bool
 	predefinedAssignments []*types.PredefinedAssignment
+	// periodLimit is the last period new placements may use; it is raised step by step
+	// from types.PreferredMaxPeriod up to types.MaxPeriodsPerDay only when needed.
+	periodLimit int
+	// tierAttempts is the number of construction attempts for the current period limit.
+	tierAttempts int
 }
 
 // NewScheduler creates a new scheduler.
@@ -31,6 +36,8 @@ func NewScheduler(config *types.Config, seed int64, attempts int, verbose bool) 
 		attempts:              attempts,
 		verbose:               verbose,
 		predefinedAssignments: nil,
+		periodLimit:           types.MaxPeriodsPerDay,
+		tierAttempts:          attempts,
 	}
 }
 
@@ -64,8 +71,82 @@ type unit struct {
 	totalPeriods     int
 }
 
+// maxTierAttempts bounds the construction attempts for the period limits below
+// types.MaxPeriodsPerDay: a limit that is too tight is usually hopeless, so fail fast.
+const maxTierAttempts = 10
+
 // Schedule runs the scheduling algorithm and returns a schedule.
+// It first tries to keep every class within the preferred last period and only
+// extends the limit one period at a time (up to types.MaxPeriodsPerDay) when no
+// schedule fits, so nobody is scheduled later than necessary.
 func (s *Scheduler) Schedule() (*types.Schedule, error) {
+	defer func() { s.periodLimit = types.MaxPeriodsPerDay }()
+
+	var err error = fmt.Errorf("unable to find feasible schedule after %d attempts", s.attempts)
+	for limit := types.PreferredMaxPeriod; limit <= types.MaxPeriodsPerDay; limit++ {
+		last := limit == types.MaxPeriodsPerDay
+		if !last && !s.limitHasCapacity(limit) {
+			s.log("Periods 1-%d cannot hold the load of some group, skipping", limit)
+			continue
+		}
+		s.periodLimit = limit
+		s.tierAttempts = s.attempts
+		if !last && s.tierAttempts > maxTierAttempts {
+			s.tierAttempts = maxTierAttempts
+		}
+		s.log("Trying to schedule within periods 1-%d...", limit)
+		var sch *types.Schedule
+		sch, err = s.scheduleWithinLimit()
+		if err == nil {
+			return sch, nil
+		}
+	}
+	return nil, err
+}
+
+// limitHasCapacity is a quick necessary condition for a period limit: every group's weekly
+// load must fit into its available periods (minus unavailable periods and one lunch break
+// per day) within periods 1..limit.
+func (s *Scheduler) limitHasCapacity(limit int) bool {
+	load := make(map[string]int)
+	for _, o := range s.config.Offerings {
+		for _, gid := range o.GroupIDs {
+			load[gid] += o.TheoryPeriods + o.LabPeriods
+		}
+	}
+	for _, pa := range s.predefinedAssignments {
+		for _, gid := range pa.GroupIDs {
+			load[gid] += pa.TheoryPeriods + pa.LabPeriods
+		}
+	}
+
+	hasBreak := s.config.Breaks != nil && len(s.config.Breaks.Periods) > 0
+	for gid, n := range load {
+		capacity := 0
+		for _, day := range types.AllDays() {
+			if !s.isDayValidForGroups([]string{gid}, day) {
+				continue
+			}
+			free := 0
+			for p := 1; p <= limit; p++ {
+				if !s.isGroupUnavailable(gid, day, p) {
+					free++
+				}
+			}
+			if hasBreak && free > 0 && !s.hasFullDayGroupUnavailable(gid, day) {
+				free-- // lunch break
+			}
+			capacity += free
+		}
+		if n > capacity {
+			return false
+		}
+	}
+	return true
+}
+
+// scheduleWithinLimit schedules using the current s.periodLimit.
+func (s *Scheduler) scheduleWithinLimit() (*types.Schedule, error) {
 	s.log("Starting scheduling (backtracking construction)...")
 
 	// Phase 1: Try with the optimal per-entity break map (highest priority per entity per day)
@@ -159,7 +240,10 @@ func (s *Scheduler) Schedule() (*types.Schedule, error) {
 		}
 
 		maxBacktracks := len(units) * 50
-		for restart := 0; restart < s.attempts; restart++ {
+		var best *types.Schedule
+		bestCost := math.Inf(1)
+		found := 0
+		for restart := 0; restart < s.tierAttempts && found < polishRuns; restart++ {
 			if restart%10 == 0 {
 				s.log("  Fallback attempt %d...", restart+1)
 			}
@@ -172,41 +256,71 @@ func (s *Scheduler) Schedule() (*types.Schedule, error) {
 			assignments, ok := s.backtrackSchedule(units, fallbackInstBreak, fallbackGroupBreak, maxBacktracks)
 			if ok && len(assignments) == len(units) {
 				s.log("  Found feasible solution on fallback attempt %d", restart+1)
-
-				sch := &types.Schedule{
-					InstructorLunchBreak:     fallbackInstBreak,
-					GroupLunchBreak:          fallbackGroupBreak,
-					InstructorBreakPriority:  fallbackInstPriority,
-					GroupBreakPriority:       fallbackGroupPriority,
-					Config:                   s.config,
+				found++
+				sch := s.buildAndPolish(assignments, fallbackInstBreak, fallbackGroupBreak,
+					fallbackInstPriority, fallbackGroupPriority)
+				if c := s.calculateCost(sch); c < bestCost {
+					best, bestCost = sch, c
 				}
-				for _, a := range assignments {
-					sch.Assignments = append(sch.Assignments, &types.Assignment{
-						Offering:     a.offering,
-						Day:          a.day,
-						TheoryStart:  a.theoryStart,
-						LabStart:     a.labStart,
-						TheoryRoomID: a.theoryRoom,
-						LabRoomID:    a.labRoom,
-					})
-				}
-
-				s.log("Phase 2: Simulated Annealing")
-				s.simulatedAnnealing(sch)
-
-				// Phase 3: พยายาม upgrade break period ของแต่ละ entity ไปเป็นที่มี priority สูงกว่าทีละ entity
-				s.log("Phase 3: Attempting per-entity break upgrade to higher-priority periods...")
-				upgraded := s.tryUpgradeEntityBreaks(sch)
-				if upgraded {
-					s.log("  Successfully upgraded at least one entity's break to higher-priority period!")
-				}
-
-				return sch, nil
 			}
+		}
+		if best != nil {
+			s.log("  Best of %d solutions: cost %.2f", found, bestCost)
+			return best, nil
 		}
 	}
 
 	return nil, fmt.Errorf("unable to find feasible schedule after %d attempts", s.attempts)
+}
+
+// polishRuns is how many feasible constructions are improved and compared; the cheapest wins.
+const polishRuns = 8
+
+// copyDayMap deep-copies a per-entity, per-day map.
+func copyDayMap(m map[string]map[types.Day]int) map[string]map[types.Day]int {
+	c := make(map[string]map[types.Day]int, len(m))
+	for k, v := range m {
+		inner := make(map[types.Day]int, len(v))
+		for d, n := range v {
+			inner[d] = n
+		}
+		c[k] = inner
+	}
+	return c
+}
+
+// buildAndPolish turns constructed assignments into a schedule and improves it with
+// simulated annealing and the per-entity break upgrade. The break maps are copied because
+// the upgrade modifies them and the same maps are reused for the next construction.
+func (s *Scheduler) buildAndPolish(assignments []innerAssignment,
+	instBreak, groupBreak, instPriority, groupPriority map[string]map[types.Day]int) *types.Schedule {
+	sch := &types.Schedule{
+		InstructorLunchBreak:    copyDayMap(instBreak),
+		GroupLunchBreak:         copyDayMap(groupBreak),
+		InstructorBreakPriority: copyDayMap(instPriority),
+		GroupBreakPriority:      copyDayMap(groupPriority),
+		Config:                  s.config,
+	}
+	for _, a := range assignments {
+		sch.Assignments = append(sch.Assignments, &types.Assignment{
+			Offering:     a.offering,
+			Day:          a.day,
+			TheoryStart:  a.theoryStart,
+			LabStart:     a.labStart,
+			TheoryRoomID: a.theoryRoom,
+			LabRoomID:    a.labRoom,
+		})
+	}
+
+	s.log("Phase 2: Simulated Annealing")
+	s.simulatedAnnealing(sch)
+
+	// Phase 3: try to upgrade each entity's break period to a higher-priority one
+	s.log("Phase 3: Attempting per-entity break upgrade to higher-priority periods...")
+	if s.tryUpgradeEntityBreaks(sch) {
+		s.log("  Successfully upgraded at least one entity's break to higher-priority period!")
+	}
+	return sch
 }
 
 // trySchedule attempts to schedule with the optimal per-entity break map.
@@ -235,7 +349,10 @@ func (s *Scheduler) trySchedule() (*types.Schedule, error) {
 	}
 
 	maxBacktracks := len(units) * 50 // Limit total backtracks per attempt
-	for restart := 0; restart < s.attempts; restart++ {
+	var best *types.Schedule
+	bestCost := math.Inf(1)
+	found := 0
+	for restart := 0; restart < s.tierAttempts && found < polishRuns; restart++ {
 		if restart%10 == 0 {
 			s.log("  Attempt %d...", restart+1)
 		}
@@ -248,38 +365,16 @@ func (s *Scheduler) trySchedule() (*types.Schedule, error) {
 		assignments, ok := s.backtrackSchedule(units, instBreak, groupBreak, maxBacktracks)
 		if ok && len(assignments) == len(units) {
 			s.log("  Found feasible solution on attempt %d", restart+1)
-
-			sch := &types.Schedule{
-				InstructorLunchBreak:     instBreak,
-				GroupLunchBreak:          groupBreak,
-				InstructorBreakPriority:  instPriority,
-				GroupBreakPriority:       groupPriority,
-				Config:                   s.config,
+			found++
+			sch := s.buildAndPolish(assignments, instBreak, groupBreak, instPriority, groupPriority)
+			if c := s.calculateCost(sch); c < bestCost {
+				best, bestCost = sch, c
 			}
-			for _, a := range assignments {
-				sch.Assignments = append(sch.Assignments, &types.Assignment{
-					Offering:     a.offering,
-					Day:          a.day,
-					TheoryStart:  a.theoryStart,
-					LabStart:     a.labStart,
-					TheoryRoomID: a.theoryRoom,
-					LabRoomID:    a.labRoom,
-				})
-			}
-
-			s.log("Phase 2: Simulated Annealing")
-			s.simulatedAnnealing(sch)
-
-			// Phase 3: พยายาม upgrade break period ของแต่ละ entity ไปเป็นที่มี priority สูงกว่า
-			// โดยตรวจสอบว่าการย้าย break ไปยัง period ที่มี priority สูงกว่าจะทำให้เกิด conflict หรือไม่
-			s.log("Phase 3: Attempting per-entity break upgrade to higher-priority periods...")
-			upgraded := s.tryUpgradeEntityBreaks(sch)
-			if upgraded {
-				s.log("  Successfully upgraded at least one entity's break to higher-priority period!")
-			}
-
-			return sch, nil
 		}
+	}
+	if best != nil {
+		s.log("  Best of %d solutions: cost %.2f", found, bestCost)
+		return best, nil
 	}
 
 	return nil, fmt.Errorf("unable to find feasible schedule with optimal breaks")
@@ -300,7 +395,7 @@ func (s *Scheduler) buildEntityBreaks() (map[string]map[types.Day]int, map[strin
 	for instID := range s.config.Instructors {
 		dayBreaks := make(map[types.Day]int)
 		for _, day := range types.AllDays() {
-			// If the instructor has full-day (1-13) unavailable, skip break entirely
+			// If the instructor has full-day (1-15) unavailable, skip break entirely
 			if s.hasFullDayInstructorUnavailable(instID, day) {
 				dayBreaks[day] = 0
 				continue
@@ -325,7 +420,7 @@ func (s *Scheduler) buildEntityBreaks() (map[string]map[types.Day]int, map[strin
 	for groupID := range s.config.Groups {
 		dayBreaks := make(map[types.Day]int)
 		for _, day := range types.AllDays() {
-			// If the group has full-day (1-13) unavailable, skip break entirely
+			// If the group has full-day (1-15) unavailable, skip break entirely
 			if s.hasFullDayGroupUnavailable(groupID, day) {
 				dayBreaks[day] = 0
 				continue
@@ -390,20 +485,20 @@ func (s *Scheduler) buildEntityBreakPriorities(
 	return instPriority, groupPriority
 }
 
-// hasFullDayInstructorUnavailable checks if an instructor has a full-day (1-13) unavailable entry on the given day.
+// hasFullDayInstructorUnavailable checks if an instructor has a full-day (1-15) unavailable entry on the given day.
 func (s *Scheduler) hasFullDayInstructorUnavailable(instID string, day types.Day) bool {
 	for _, iu := range s.config.InstructorUnavailable {
-		if iu.InstructorID == instID && iu.Day == day && iu.StartPeriod == 1 && iu.EndPeriod == 13 {
+		if iu.InstructorID == instID && iu.Day == day && types.IsFullDay(iu.StartPeriod, iu.EndPeriod) {
 			return true
 		}
 	}
 	return false
 }
 
-// hasFullDayGroupUnavailable checks if a group has a full-day (1-13) unavailable entry on the given day.
+// hasFullDayGroupUnavailable checks if a group has a full-day (1-15) unavailable entry on the given day.
 func (s *Scheduler) hasFullDayGroupUnavailable(groupID string, day types.Day) bool {
 	for _, gu := range s.config.GroupsUnavailable {
-		if gu.GroupID == groupID && gu.Day == day && gu.StartPeriod == 1 && gu.EndPeriod == 13 {
+		if gu.GroupID == groupID && gu.Day == day && types.IsFullDay(gu.StartPeriod, gu.EndPeriod) {
 			return true
 		}
 	}
@@ -449,7 +544,7 @@ func (s *Scheduler) estimateDomainSize(o *types.Offering, total int,
 		if !s.isDayValidForGroups(o.GroupIDs, day) {
 			continue
 		}
-		maxStart := types.MaxPeriodsPerDay - total + 1
+		maxStart := s.periodLimit - total + 1
 		if maxStart < 1 {
 			continue
 		}
@@ -513,6 +608,7 @@ type pos struct {
 	start      int
 	theoryRoom string
 	labRoom    string
+	score      float64 // heuristic cost used to order candidate positions (lower is tried first)
 }
 
 // backtrackSchedule attempts to schedule all units using backtracking search.
@@ -750,6 +846,162 @@ func (s *Scheduler) pickRooms(o *types.Offering, day types.Day, start, theoryPer
 	return theoryRoom, labRoom, true
 }
 
+// Weights of the "late period" penalty. A period is late when it is after
+// types.PreferredMaxPeriod. The penalty is applied per person (instructor or group) and is
+// convex, so late periods are spread over many people instead of piling up on a few.
+const (
+	latePeriodWeight = 150.0 // each late period
+	lateSquareWeight = 100.0 // (late periods of a person)^2: spread the load across people
+	lateDayWeight    = 400.0 // (days with late periods of a person)^2: avoid late classes on many days
+	lateDepthWeight  = 100.0 // per period beyond the preferred last period (period 15 is worse than 10)
+)
+
+// latePenaltyDelta is the extra penalty when a person who already has count late periods
+// on lateDays days gets add more late periods (total depth beyond the preferred period)
+// on newDays additional days.
+func latePenaltyDelta(count, lateDays, add, newDays, depth int) float64 {
+	if add == 0 {
+		return 0
+	}
+	c0, c1 := float64(count), float64(count+add)
+	d0, d1 := float64(lateDays), float64(lateDays+newDays)
+	return latePeriodWeight*float64(add) +
+		lateSquareWeight*(c1*c1-c0*c0) +
+		lateDayWeight*(d1*d1-d0*d0) +
+		lateDepthWeight*float64(depth)
+}
+
+// lateLoad counts the late periods and the days having late periods in a booking map.
+func lateLoad(booked map[resourceKey]bool) (count int, days map[types.Day]bool) {
+	for rk := range booked {
+		if rk.period > types.PreferredMaxPeriod {
+			if days == nil {
+				days = make(map[types.Day]bool)
+			}
+			days[rk.day] = true
+			count++
+		}
+	}
+	return count, days
+}
+
+// positionScore rates placing unit u at (day, start): the extra late-period penalty it adds
+// to the people involved (given their current bookings) plus a preference for early starts.
+func (s *Scheduler) positionScore(u unit, day types.Day, start int,
+	instB, grpB map[string]map[resourceKey]bool) float64 {
+	o := u.offering
+
+	// late periods this placement adds: all of them, and the lab ones (co-instructors: lab only)
+	var all, labOnly, depthAll, depthLab int
+	for p := start; p < start+u.totalPeriods; p++ {
+		if p <= types.PreferredMaxPeriod {
+			continue
+		}
+		all++
+		depthAll += p - types.PreferredMaxPeriod
+		if p >= start+u.theoryPeriods {
+			labOnly++
+			depthLab += p - types.PreferredMaxPeriod
+		}
+	}
+
+	score := float64(start) * 5.0
+	if u.theoryPeriods > 0 && u.labPeriods > 0 {
+		// same preference as calculateCost: theory + lab blocks start at period 1 or 6
+		if start != 1 && start != 6 {
+			score += 100.0 * math.Min(math.Abs(float64(start-1)), math.Abs(float64(start-6)))
+		}
+	}
+
+	person := func(booked map[resourceKey]bool, add, depth int) {
+		if add == 0 {
+			return
+		}
+		count, days := lateLoad(booked)
+		newDays := 1
+		if days[day] {
+			newDays = 0
+		}
+		score += latePenaltyDelta(count, len(days), add, newDays, depth)
+	}
+	if o.MainInstructorID != "x" {
+		person(instB[o.MainInstructorID], all, depthAll)
+	}
+	for _, coID := range o.CoInstructorIDs {
+		person(instB[coID], labOnly, depthLab)
+	}
+	for _, gid := range o.GroupIDs {
+		person(grpB[gid], all, depthAll)
+	}
+
+	// small jitter so that equal-looking positions differ between attempts
+	return score + s.rng.Float64()*10.0
+}
+
+// latePenalty is the total per-person late-period penalty of a set of assignments
+// (scheduled ones plus the pre-defined ones from config.txt).
+func (s *Scheduler) latePenalty(assignments []*types.Assignment) float64 {
+	type person struct {
+		id    string
+		group bool
+	}
+	type load struct {
+		count, depth int
+		days         map[types.Day]bool
+	}
+	loads := make(map[person]*load)
+	add := func(id string, group bool, day types.Day, first, n int) {
+		for p := first; p < first+n; p++ {
+			if p <= types.PreferredMaxPeriod {
+				continue
+			}
+			k := person{id, group}
+			l := loads[k]
+			if l == nil {
+				l = &load{days: make(map[types.Day]bool)}
+				loads[k] = l
+			}
+			l.count++
+			l.depth += p - types.PreferredMaxPeriod
+			l.days[day] = true
+		}
+	}
+
+	for _, a := range assignments {
+		o := a.Offering
+		if o.MainInstructorID != "x" {
+			add(o.MainInstructorID, false, a.Day, a.TheoryStart, o.TheoryPeriods)
+			add(o.MainInstructorID, false, a.Day, a.LabStart, o.LabPeriods)
+		}
+		for _, coID := range o.CoInstructorIDs {
+			add(coID, false, a.Day, a.LabStart, o.LabPeriods)
+		}
+		for _, gid := range o.GroupIDs {
+			add(gid, true, a.Day, a.TheoryStart, o.TheoryPeriods)
+			add(gid, true, a.Day, a.LabStart, o.LabPeriods)
+		}
+	}
+	for _, pa := range s.predefinedAssignments {
+		if pa.MainInstructorID != "x" {
+			add(pa.MainInstructorID, false, pa.Day, pa.TheoryStart, pa.TheoryPeriods)
+			add(pa.MainInstructorID, false, pa.Day, pa.LabStart, pa.LabPeriods)
+		}
+		for _, coID := range pa.CoInstructorIDs {
+			add(coID, false, pa.Day, pa.LabStart, pa.LabPeriods)
+		}
+		for _, gid := range pa.GroupIDs {
+			add(gid, true, pa.Day, pa.TheoryStart, pa.TheoryPeriods)
+			add(gid, true, pa.Day, pa.LabStart, pa.LabPeriods)
+		}
+	}
+
+	total := 0.0
+	for _, l := range loads {
+		total += latePenaltyDelta(0, 0, l.count, len(l.days), l.depth)
+	}
+	return total
+}
+
 // genPositions generates valid (day, start) positions for an offering
 // considering CURRENT resource state (room booking, double booking).
 // Returns positions sorted by heuristic quality.
@@ -769,7 +1021,7 @@ func (s *Scheduler) genPositions(
 		if !s.isDayValidForGroups(o.GroupIDs, day) {
 			continue
 		}
-		maxStart := types.MaxPeriodsPerDay - total + 1
+		maxStart := s.periodLimit - total + 1
 		if maxStart < 1 {
 			continue
 		}
@@ -863,12 +1115,14 @@ func (s *Scheduler) genPositions(
 				start:      start,
 				theoryRoom: theoryRoom,
 				labRoom:    labRoom,
+				score:      s.positionScore(u, day, start, instB, grpB),
 			})
 		}
 	}
 
-	// Shuffle for randomness
-	s.rng.Shuffle(len(positions), func(i, j int) { positions[i], positions[j] = positions[j], positions[i] })
+	// Try the best positions first (early periods, little extra late load for anyone).
+	// The random jitter in the score keeps different attempts from being identical.
+	sort.SliceStable(positions, func(i, j int) bool { return positions[i].score < positions[j].score })
 
 	return positions
 }
@@ -1217,19 +1471,26 @@ func (s *Scheduler) isInstructorNoLate(instructorID string, day types.Day, start
 // ==========================================
 
 func (s *Scheduler) simulatedAnnealing(schedule *types.Schedule) {
-	t := 100.0
-	tMin := 0.1
-	alpha := 0.98
-	maxIter := 2000
-	stagnationLimit := 500
+	t := 500.0 // costs are in the hundreds, so start warm enough to accept some worse moves
+	tMin := 1.0
+	alpha := 0.9995
+	maxIter := 15000
+	stagnationLimit := 3000
 	stagnation := 0
 
-	bestCost := s.calculateCost(schedule)
+	curCost := s.calculateCost(schedule)
+	bestCost := curCost
 	bestAssign := copyAssignments(schedule.Assignments)
 	s.log("  Initial cost: %.2f", bestCost)
 
 	for iter := 0; iter < maxIter && t > tMin; iter++ {
-		newAssign, ok := s.randomShift(schedule)
+		var newAssign []*types.Assignment
+		var ok bool
+		if s.rng.Intn(2) == 0 {
+			newAssign, ok = s.randomShift(schedule)
+		} else {
+			newAssign, ok = s.swapShift(schedule)
+		}
 		if !ok {
 			stagnation++
 			if stagnation >= stagnationLimit {
@@ -1242,17 +1503,23 @@ func (s *Scheduler) simulatedAnnealing(schedule *types.Schedule) {
 		schedule.Assignments = newAssign
 		newCost := s.calculateCost(schedule)
 
-		delta := newCost - bestCost
+		delta := newCost - curCost
 
 		if delta < 0 || s.rng.Float64() < math.Exp(-delta/t) {
+			curCost = newCost
 			if newCost < bestCost {
 				bestCost = newCost
 				bestAssign = copyAssignments(newAssign)
 				stagnation = 0
+			} else {
+				stagnation++
 			}
 		} else {
 			schedule.Assignments = oldAssign
 			stagnation++
+		}
+		if stagnation >= stagnationLimit {
+			break
 		}
 
 		t *= alpha
@@ -1402,27 +1669,44 @@ func copyAssignments(a []*types.Assignment) []*types.Assignment {
 	return r
 }
 
-func (s *Scheduler) randomShift(schedule *types.Schedule) ([]*types.Assignment, bool) {
-	ass := schedule.Assignments
-	if len(ass) == 0 {
-		return nil, false
+// endPeriod returns the last period used by an assignment.
+func endPeriod(a *types.Assignment) int {
+	end := 0
+	if a.TheoryStart > 0 {
+		end = a.TheoryStart + a.Offering.TheoryPeriods - 1
 	}
-
-	idx := s.rng.Intn(len(ass))
-	a := ass[idx]
-	o := a.Offering
-	totalPeriods := o.TheoryPeriods + o.LabPeriods
-
-	rest := make([]*types.Assignment, 0, len(ass)-1)
-	for i, v := range ass {
-		if i != idx {
-			rest = append(rest, v)
+	if a.LabStart > 0 {
+		if e := a.LabStart + a.Offering.LabPeriods - 1; e > end {
+			end = e
 		}
 	}
+	return end
+}
 
-	instB := make(map[string]map[resourceKey]bool)
-	grpB := make(map[string]map[resourceKey]bool)
-	roomB := make(map[string]map[resourceKey]bool)
+// pickShiftTarget returns the index of an assignment to move. Half of the time it prefers a
+// class that runs past the preferred last period.
+func (s *Scheduler) pickShiftTarget(ass []*types.Assignment) int {
+	idx := s.rng.Intn(len(ass))
+	if s.rng.Intn(2) == 0 {
+		var late []int
+		for i, v := range ass {
+			if v.Offering.TheoryPeriods+v.Offering.LabPeriods > 0 && endPeriod(v) > types.PreferredMaxPeriod {
+				late = append(late, i)
+			}
+		}
+		if len(late) > 0 {
+			idx = late[s.rng.Intn(len(late))]
+		}
+	}
+	return idx
+}
+
+// bookingsFor builds the instructor/group/room bookings of the given assignments plus the
+// pre-defined ones from config.txt, so annealing moves never create conflicts.
+func (s *Scheduler) bookingsFor(rest []*types.Assignment) (instB, grpB, roomB map[string]map[resourceKey]bool) {
+	instB = make(map[string]map[resourceKey]bool)
+	grpB = make(map[string]map[resourceKey]bool)
+	roomB = make(map[string]map[resourceKey]bool)
 
 	// Pre-book predefined assignments' resources so SA doesn't create conflicts
 	for _, pa := range s.predefinedAssignments {
@@ -1517,126 +1801,145 @@ func (s *Scheduler) randomShift(schedule *types.Schedule) ([]*types.Assignment, 
 		}
 	}
 
+	return instB, grpB, roomB
+}
+
+// placeAt checks whether offering o can be placed at (day, start) given the bookings and, if so,
+// returns the assignment (rooms are picked at random among the free ones).
+func (s *Scheduler) placeAt(schedule *types.Schedule, o *types.Offering, day types.Day, start int,
+	instB, grpB, roomB map[string]map[resourceKey]bool) (*types.Assignment, bool) {
+	total := o.TheoryPeriods + o.LabPeriods
+	if start < 1 || start+total-1 > s.periodLimit || !s.isDayValidForGroups(o.GroupIDs, day) {
+		return nil, false
+	}
+	// Check per-entity break conflicts for this offering
+	if hasBreakConflict(o, day, start, total, o.TheoryPeriods,
+		schedule.InstructorLunchBreak, schedule.GroupLunchBreak) {
+		return nil, false
+	}
+
+	theoryRoom, labRoom, ok := s.pickRooms(o, day, start, o.TheoryPeriods, o.LabPeriods, roomB, true)
+	if !ok {
+		return nil, false
+	}
+
+	for p := start; p < start+total; p++ {
+		rk := resourceKey{day: day, period: p}
+		isTheory := p < start+o.TheoryPeriods
+
+		for _, gid := range o.GroupIDs {
+			if s.isGroupUnavailable(gid, day, p) || grpB[gid][rk] {
+				return nil, false
+			}
+		}
+		if o.MainInstructorID != "x" {
+			id := o.MainInstructorID
+			if s.isInstructorUnavailable(id, day, p) || s.isInstructorUnavailableMain(id, day, p) ||
+				s.isInstructorNoLate(id, day, start, total) || instB[id][rk] {
+				return nil, false
+			}
+		}
+		if !isTheory {
+			for _, coID := range o.CoInstructorIDs {
+				if s.isInstructorUnavailable(coID, day, p) || instB[coID][rk] {
+					return nil, false
+				}
+			}
+		}
+	}
+
+	return &types.Assignment{
+		Offering:     o,
+		Day:          day,
+		TheoryStart:  start,
+		LabStart:     start + o.TheoryPeriods,
+		TheoryRoomID: theoryRoom,
+		LabRoomID:    labRoom,
+	}, true
+}
+
+func (s *Scheduler) randomShift(schedule *types.Schedule) ([]*types.Assignment, bool) {
+	ass := schedule.Assignments
+	if len(ass) == 0 {
+		return nil, false
+	}
+
+	idx := s.pickShiftTarget(ass)
+	o := ass[idx].Offering
+	total := o.TheoryPeriods + o.LabPeriods
+
+	rest := make([]*types.Assignment, 0, len(ass)-1)
+	for i, v := range ass {
+		if i != idx {
+			rest = append(rest, v)
+		}
+	}
+	instB, grpB, roomB := s.bookingsFor(rest)
+
 	days := types.AllDays()
 	s.rng.Shuffle(len(days), func(i, j int) { days[i], days[j] = days[j], days[i] })
 
 	for _, day := range days {
-		if !s.isDayValidForGroups(o.GroupIDs, day) {
-			continue
-		}
-
-		maxStart := types.MaxPeriodsPerDay - totalPeriods + 1
+		maxStart := s.periodLimit - total + 1
 		if maxStart < 1 {
 			continue
 		}
-
 		starts := make([]int, maxStart)
-		for i := 0; i < maxStart; i++ {
+		for i := range starts {
 			starts[i] = i + 1
 		}
 		s.rng.Shuffle(len(starts), func(i, j int) { starts[i], starts[j] = starts[j], starts[i] })
 
 		for _, start := range starts {
-			end := start + totalPeriods - 1
-
-			// Check per-entity break conflicts for this offering
-			if hasBreakConflict(o, day, start, totalPeriods, o.TheoryPeriods,
-				schedule.InstructorLunchBreak, schedule.GroupLunchBreak) {
-				continue
-			}
-
-			theoryRoom, labRoom, roomsOK := s.pickRooms(o, day, start, o.TheoryPeriods, o.LabPeriods, roomB, true)
-			if !roomsOK {
-				continue
-			}
-
-			allValid := true
-			for p := start; p <= end; p++ {
-				rk := resourceKey{day: day, period: p}
-				isTheory := p < start+o.TheoryPeriods
-
-				for _, gid := range o.GroupIDs {
-					if s.isGroupUnavailable(gid, day, p) {
-						allValid = false
-						break
-					}
-					if grpB[gid] != nil && grpB[gid][rk] {
-						allValid = false
-						break
-					}
-				}
-				if !allValid {
-					break
-				}
-
-				if isTheory && o.MainInstructorID != "x" {
-					if s.isInstructorUnavailable(o.MainInstructorID, day, p) {
-						allValid = false
-						break
-					}
-					if s.isInstructorUnavailableMain(o.MainInstructorID, day, p) {
-						allValid = false
-						break
-					}
-					if s.isInstructorNoLate(o.MainInstructorID, day, start, totalPeriods) {
-						allValid = false
-						break
-					}
-					if instB[o.MainInstructorID] != nil && instB[o.MainInstructorID][rk] {
-						allValid = false
-						break
-					}
-				}
-				if !isTheory {
-					if o.MainInstructorID != "x" {
-						if s.isInstructorUnavailable(o.MainInstructorID, day, p) {
-							allValid = false
-							break
-						}
-						if s.isInstructorUnavailableMain(o.MainInstructorID, day, p) {
-							allValid = false
-							break
-						}
-						if s.isInstructorNoLate(o.MainInstructorID, day, start, totalPeriods) {
-							allValid = false
-							break
-						}
-						if instB[o.MainInstructorID] != nil && instB[o.MainInstructorID][rk] {
-							allValid = false
-							break
-						}
-					}
-					for _, coID := range o.CoInstructorIDs {
-						if s.isInstructorUnavailable(coID, day, p) {
-							allValid = false
-							break
-						}
-						if instB[coID] != nil && instB[coID][rk] {
-							allValid = false
-							break
-						}
-					}
-				}
-				if !allValid {
-					break
-				}
-			}
-
-			if allValid {
-				newAss := &types.Assignment{
-					Offering:     o,
-					Day:          day,
-					TheoryStart:  start,
-					LabStart:     start + o.TheoryPeriods,
-					TheoryRoomID: theoryRoom,
-					LabRoomID:    labRoom,
-				}
-				return append(rest, newAss), true
+			if na, ok := s.placeAt(schedule, o, day, start, instB, grpB, roomB); ok {
+				return append(rest, na), true
 			}
 		}
 	}
 
 	return nil, false
+}
+
+// swapShift exchanges the time slots of two classes (each takes the other's day and start).
+// A plain relocation cannot do this when the schedule is tight, which is exactly when
+// pulling a late class earlier requires pushing another class later.
+func (s *Scheduler) swapShift(schedule *types.Schedule) ([]*types.Assignment, bool) {
+	ass := schedule.Assignments
+	if len(ass) < 2 {
+		return nil, false
+	}
+	i := s.pickShiftTarget(ass)
+	j := s.rng.Intn(len(ass))
+	if i == j {
+		return nil, false
+	}
+	a, b := ass[i], ass[j]
+	if a.Day == b.Day && a.TheoryStart == b.TheoryStart {
+		return nil, false
+	}
+
+	rest := make([]*types.Assignment, 0, len(ass)-2)
+	for k, v := range ass {
+		if k != i && k != j {
+			rest = append(rest, v)
+		}
+	}
+	instB, grpB, roomB := s.bookingsFor(rest)
+
+	na, ok := s.placeAt(schedule, a.Offering, b.Day, b.TheoryStart, instB, grpB, roomB)
+	if !ok {
+		return nil, false
+	}
+	s.bookResources(innerAssignment{
+		offering: na.Offering, day: na.Day, theoryStart: na.TheoryStart, labStart: na.LabStart,
+		theoryRoom: na.TheoryRoomID, labRoom: na.LabRoomID,
+	}, na.Offering, na.Offering.TheoryPeriods+na.Offering.LabPeriods, instB, grpB, roomB)
+
+	nb, ok := s.placeAt(schedule, b.Offering, a.Day, a.TheoryStart, instB, grpB, roomB)
+	if !ok {
+		return nil, false
+	}
+	return append(rest, na, nb), true
 }
 
 // ==========================================
@@ -1683,20 +1986,6 @@ func (s *Scheduler) calculateCost(sch *types.Schedule) float64 {
 			cost += float64(a.LabStart) * 5.0
 		}
 
-		if a.TheoryStart > 0 {
-			for p := a.TheoryStart; p < a.TheoryStart+o.TheoryPeriods; p++ {
-				if p >= 9 {
-					cost += 50.0
-				}
-			}
-		}
-		if a.LabStart > 0 {
-			for p := a.LabStart; p < a.LabStart+o.LabPeriods; p++ {
-				if p >= 9 {
-					cost += 50.0
-				}
-			}
-		}
 
 		if o.TheoryPeriods > 0 && o.LabPeriods > 0 {
 			if a.TheoryRoomID != "x" && a.LabRoomID != "x" && a.TheoryRoomID != a.LabRoomID {
@@ -1704,6 +1993,9 @@ func (s *Scheduler) calculateCost(sch *types.Schedule) float64 {
 			}
 		}
 	}
+
+	// Avoid periods after the preferred last period; share the unavoidable ones fairly
+	cost += s.latePenalty(sch.Assignments)
 
 	roomCount := make(map[string]int)
 	for _, a := range sch.Assignments {

@@ -310,9 +310,10 @@ func parseCommaList(s string) []string {
 	return result
 }
 
+// parseCommaOrX parses a comma-separated ID list; "x" or "none" means no entries.
 func parseCommaOrX(s string) []string {
 	s = strings.TrimSpace(s)
-	if s == "" || s == "x" {
+	if s == "" || s == "x" || strings.EqualFold(s, "none") {
 		return nil
 	}
 	return parseCommaList(s)

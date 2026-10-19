@@ -203,10 +203,10 @@ func main() {
 				dayBreaks := make(map[types.Day]int)
 				dayPriorities := make(map[types.Day]int)
 				for _, day := range types.AllDays() {
-					// Check for full-day (1-13) unavailable - skip break entirely
+					// Check for full-day (1-15) unavailable - skip break entirely
 					hasFullDayUnavailable := false
 					for _, iu := range parseResult.Config.InstructorUnavailable {
-						if iu.InstructorID == instID && iu.Day == day && iu.StartPeriod == 1 && iu.EndPeriod == 13 {
+						if iu.InstructorID == instID && iu.Day == day && types.IsFullDay(iu.StartPeriod, iu.EndPeriod) {
 							hasFullDayUnavailable = true
 							break
 						}
@@ -260,10 +260,10 @@ func main() {
 				dayBreaks := make(map[types.Day]int)
 				dayPriorities := make(map[types.Day]int)
 				for _, day := range types.AllDays() {
-					// Check for full-day (1-13) unavailable - skip break entirely
+					// Check for full-day (1-15) unavailable - skip break entirely
 					hasFullDayUnavailable := false
 					for _, gu := range parseResult.Config.GroupsUnavailable {
-						if gu.GroupID == groupID && gu.Day == day && gu.StartPeriod == 1 && gu.EndPeriod == 13 {
+						if gu.GroupID == groupID && gu.Day == day && types.IsFullDay(gu.StartPeriod, gu.EndPeriod) {
 							hasFullDayUnavailable = true
 							break
 						}
@@ -479,7 +479,7 @@ func printConfigFormat() {
    Format: <course_id> <theory_periods> <lab_periods> <group_ids> <main_instructor_id> <co_instructors> <theory_rooms> <lab_rooms>
      group_ids: รหัสกลุ่ม คั่นด้วยจุลภาค (,) ถ้าหลายกลุ่มให้เรียนรวมกัน
      main_instructor_id: รหัสอาจารย์หลัก, ใช้ "x" ถ้าไม่มี
-     co_instructors: รหัสอาจารย์ร่วม คั่นด้วยจุลภาค, ใช้ "x" ถ้าไม่มี
+     co_instructors: รหัสอาจารย์ร่วม คั่นด้วยจุลภาค, ใช้ "x" หรือ "none" ถ้าไม่มี
      theory_rooms: ห้องทฤษฎี คั่นด้วยจุลภาค, ใช้ "x" ถ้าไม่ต้องระบุ
      lab_rooms: ห้องปฏิบัติ คั่นด้วยจุลภาค, ใช้ "x" ถ้าไม่ต้องระบุ
    Example:
@@ -501,7 +501,7 @@ func printConfigFormat() {
      mode: "hidden" = ไม่แสดง, หรือข้อความ
    Example:
      I001 we 1-4 none "ประชุม"
-     I002 sa 1-13 R101 hidden
+     I002 sa 1-15 R101 hidden
 
 8. [instructor_unavailable_main] - กำหนดช่วงเวลาที่อาจารย์ไม่สามารถเป็นอาจารย์หลักได้
    Format: <instructor_id> <day> <start_period-end_period>
@@ -526,7 +526,7 @@ func printConfigFormat() {
   fr = ศุกร์, sa = เสาร์, su = อาทิตย์
 
 === Periods ===
-  มีทั้งหมด 13 คาบต่อวัน (1-13)
+  มีทั้งหมด 15 คาบต่อวัน (1-15) โดยปกติจะจัดไม่เกินคาบที่ 9 เว้นแต่จำเป็น
 
 === Notes ===
   - คอมเมนต์เริ่มต้นด้วย # ไปจนจบบรรทัด

@@ -277,4 +277,41 @@ type PredefinedData struct {
 }
 
 // MaxPeriodsPerDay is the maximum number of periods in a day.
-const MaxPeriodsPerDay = 13
+const MaxPeriodsPerDay = 15
+
+// PreferredMaxPeriod is the last period the scheduler normally uses.
+// Periods after it are used only when no schedule fits within it.
+const PreferredMaxPeriod = 9
+
+// periodTimes holds the start-end time of each period (index 0 is unused).
+var periodTimes = [MaxPeriodsPerDay + 1]string{
+	"",
+	"08.00-09.00",
+	"09.00-10.00",
+	"10.05-11.05",
+	"11.05-12.05",
+	"12.05-13.05",
+	"13.05-14.05",
+	"14.05-15.05",
+	"15.10-16.10",
+	"16.10-17.10",
+	"17.10-18.10",
+	"18.10-19.10",
+	"19.10-20.10",
+	"20.10-21.10",
+	"21.10-22.10",
+	"22.10-23.10",
+}
+
+// PeriodTime returns the time range (e.g. "08.00-09.00") of a period, or "" if out of range.
+func PeriodTime(period int) string {
+	if period < 1 || period > MaxPeriodsPerDay {
+		return ""
+	}
+	return periodTimes[period]
+}
+
+// IsFullDay reports whether a period range covers the whole day.
+func IsFullDay(startPeriod, endPeriod int) bool {
+	return startPeriod == 1 && endPeriod >= MaxPeriodsPerDay
+}

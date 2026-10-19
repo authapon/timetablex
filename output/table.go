@@ -40,7 +40,7 @@ func NewTableRenderer(config *types.Config, schedule *types.Schedule) *TableRend
 //   - theory_room:      ห้องทฤษฎีที่ใช้ (x ถ้าไม่มี)
 //   - lab_room:         ห้องปฏิบัติที่ใช้ (x ถ้าไม่มี)
 //   - main_instructor:  อาจารย์หลัก (x ถ้าไม่มี)
-//   - co_instructors:   อาจารย์ร่วม (x ถ้าไม่มี; คั่นด้วยจุลภาค ถ้ามีหลายคน)
+//   - co_instructors:   อาจารย์ร่วม (x หรือ none ถ้าไม่มี; คั่นด้วยจุลภาค ถ้ามีหลายคน)
 //
 // สามารถใช้ไฟล์ table.txt เป็น pre-defined สำหรับจัดตารางเริ่มต้นหรือแก้ไขปรับปรุงได้
 func (r *TableRenderer) Render() string {
@@ -93,7 +93,7 @@ func (r *TableRenderer) Render() string {
 
 		// Co-instructors
 		coInstructors := off.CoInstructorRaw
-		if coInstructors == "" {
+		if len(off.CoInstructorIDs) == 0 {
 			coInstructors = "x"
 		}
 

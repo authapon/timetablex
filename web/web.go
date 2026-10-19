@@ -1318,7 +1318,7 @@ PRO201 2 3 G01,G02 I001 I002 R101 LAB1
 6
 7</pre>
       <div style="color:var(--gray);font-size:0.85rem;margin-top:0.5rem;">
-        💡 <strong>หมายเหตุ:</strong> ค่า <span class="code">x</span> หมายถึงไม่ได้ระบุ/ไม่มี | คอมเมนต์ใช้ <span class="code">#</span> | day codes: mo=จันทร์, tu=อังคาร, we=พุธ, th=พฤหัสบดี, fr=ศุกร์, sa=เสาร์, su=อาทิตย์ | มี 13 คาบต่อวัน
+        💡 <strong>หมายเหตุ:</strong> ค่า <span class="code">x</span> หมายถึงไม่ได้ระบุ/ไม่มี | คอมเมนต์ใช้ <span class="code">#</span> | day codes: mo=จันทร์, tu=อังคาร, we=พุธ, th=พฤหัสบดี, fr=ศุกร์, sa=เสาร์, su=อาทิตย์ | มี 15 คาบต่อวัน (จัดไม่เกินคาบที่ 9 เว้นแต่จำเป็น)
       </div>
     </div>
 

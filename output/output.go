@@ -28,6 +28,7 @@ func (r *TimetableRenderer) Render() string {
 	var sb strings.Builder
 
 	sb.WriteString("# Timetable (ตารางสอน)\n\n")
+	sb.WriteString("สีของช่อง: 🟦 สอนหลัก (พื้นหลังสีฟ้า) | 🟧 สอนร่วม (พื้นหลังสีส้ม; ในตารางรายกลุ่มและรายห้อง หมายถึงคาบที่มีอาจารย์ร่วม) | ⬜ อื่น ๆ เช่น พักเที่ยง\n\n")
 	sb.WriteString("---\n\n")
 
 	// Section 1: Instructor timetables
@@ -145,35 +146,11 @@ func (r *TimetableRenderer) renderInstructorTimetables(sb *strings.Builder) {
 			continue
 		}
 
-		sb.WriteString("| วัน | คาบที่ | วิชา | ประเภทคาบ | กลุ่มเรียน | ห้องเรียน |\n")
-		sb.WriteString("|-----|--------|------|-----------|-----------|----------|\n")
-
-		// Order days
-		orderedDays := r.orderDays(activeDays)
-
-		for _, day := range orderedDays {
-			dayName := types.DayFullName[day]
-			// Get periods for this instructor on this day
+		r.renderGridTable(sb, r.orderDays(activeDays), func(day types.Day) []*periodEntry {
 			periods := r.getInstructorPeriods(inst.ID, day)
-
-			// Check for unavailable entries with messages
 			unavailableMsgs := r.getInstructorUnavailableMessages(inst.ID, day)
-
-			// Merge periods and unavailable messages
-			allPeriods := r.mergeInstructorPeriods(periods, unavailableMsgs, inst.ID, day)
-
-			for _, pe := range allPeriods {
-				if pe.periodStart == pe.periodEnd {
-					sb.WriteString(fmt.Sprintf("| %s | %d | %s | %s | %s | %s |\n",
-						dayName, pe.periodStart, pe.subject, pe.periodType, pe.groups, pe.room))
-				} else {
-					sb.WriteString(fmt.Sprintf("| %s | %d-%d | %s | %s | %s | %s |\n",
-						dayName, pe.periodStart, pe.periodEnd, pe.subject, pe.periodType, pe.groups, pe.room))
-				}
-			}
-		}
-
-		sb.WriteString("\n")
+			return r.mergeInstructorPeriods(periods, unavailableMsgs, inst.ID, day)
+		}, "กลุ่ม", "ห้อง")
 	}
 }
 
@@ -202,9 +179,6 @@ func (r *TimetableRenderer) renderGroupTimetables(sb *strings.Builder) {
 			sb.WriteString("ไม่มีการเรียน\n\n")
 			continue
 		}
-
-		sb.WriteString("| วัน | คาบที่ | วิชา | ประเภทคาบ | อาจารย์ | ห้องเรียน |\n")
-		sb.WriteString("|-----|--------|------|-----------|---------|----------|\n")
 
 		// Check for unavailable entries with hidden/message mode
 		unavailableMap := make(map[types.Day][]*periodEntry)
@@ -236,28 +210,10 @@ func (r *TimetableRenderer) renderGroupTimetables(sb *strings.Builder) {
 			}
 		}
 
-		orderedDays := r.orderDays(activeDays)
-
-		for _, day := range orderedDays {
-			dayName := types.DayFullName[day]
+		r.renderGridTable(sb, r.orderDays(activeDays), func(day types.Day) []*periodEntry {
 			assignments := r.GetAssignmentsForGroupOnDay(grp.ID, day)
-			unavailable := unavailableMap[day]
-
-			// Build period entries for this day
-			periodEntries := r.buildGroupPeriodEntries(grp.ID, day, assignments, unavailable)
-
-			for _, pe := range periodEntries {
-				if pe.periodStart == pe.periodEnd {
-					sb.WriteString(fmt.Sprintf("| %s | %d | %s | %s | %s | %s |\n",
-						dayName, pe.periodStart, pe.subject, pe.periodType, pe.groups, pe.room))
-				} else {
-					sb.WriteString(fmt.Sprintf("| %s | %d-%d | %s | %s | %s | %s |\n",
-						dayName, pe.periodStart, pe.periodEnd, pe.subject, pe.periodType, pe.groups, pe.room))
-				}
-			}
-		}
-
-		sb.WriteString("\n")
+			return r.buildGroupPeriodEntries(grp.ID, day, assignments, unavailableMap[day])
+		}, "อาจารย์", "ห้อง")
 	}
 }
 
@@ -287,28 +243,32 @@ func (r *TimetableRenderer) renderRoomTimetables(sb *strings.Builder) {
 			continue
 		}
 
-		sb.WriteString("| วัน | คาบที่ | วิชา | ประเภทคาบ | กลุ่มเรียน | อาจารย์ |\n")
-		sb.WriteString("|-----|--------|------|-----------|-----------|---------|\n")
-
-		orderedDays := r.orderDays(activeDays)
-
-		for _, day := range orderedDays {
-			dayName := types.DayFullName[day]
-			periodEntries := r.buildRoomPeriodEntries(rm.ID, day)
-
-			for _, pe := range periodEntries {
-				if pe.periodStart == pe.periodEnd {
-					sb.WriteString(fmt.Sprintf("| %s | %d | %s | %s | %s | %s |\n",
-						dayName, pe.periodStart, pe.subject, pe.periodType, pe.groups, pe.room))
-				} else {
-					sb.WriteString(fmt.Sprintf("| %s | %d-%d | %s | %s | %s | %s |\n",
-						dayName, pe.periodStart, pe.periodEnd, pe.subject, pe.periodType, pe.groups, pe.room))
-				}
-			}
-		}
-
-		sb.WriteString("\n")
+		r.renderGridTable(sb, r.orderDays(activeDays), func(day types.Day) []*periodEntry {
+			return r.buildRoomPeriodEntries(rm.ID, day)
+		}, "กลุ่ม", "อาจารย์")
 	}
+}
+
+// Teaching roles used to colour the timetable cells.
+const (
+	roleMain = "main" // taught by the main instructor only
+	roleCo   = "co"   // taught with a co-instructor
+)
+
+// instructorRole is the role of an instructor in the instructor timetable.
+func instructorRole(isMain bool) string {
+	if isMain {
+		return roleMain
+	}
+	return roleCo
+}
+
+// coRole is the role shown in group/room timetables: co when the lab has co-instructors.
+func coRole(o *types.Offering) string {
+	if len(o.CoInstructorIDs) > 0 {
+		return roleCo
+	}
+	return roleMain
 }
 
 // periodEntry represents a single row in a timetable.
@@ -317,6 +277,7 @@ type periodEntry struct {
 	periodEnd   int
 	subject     string
 	periodType  string
+	role        string // roleMain, roleCo, or "" (lunch break, unavailable)
 	groups      string // Instructor or group names
 	room        string // Room or instructor names
 }
@@ -446,6 +407,7 @@ func (r *TimetableRenderer) getInstructorPeriods(instructorID string, day types.
 				periodEnd:   periodEnd,
 				subject:     subjectDisplay,
 				periodType:  "ทฤษฎี",
+				role:        roleMain,
 				groups:      groupNames,
 				room:        roomName,
 			})
@@ -474,6 +436,7 @@ func (r *TimetableRenderer) getInstructorPeriods(instructorID string, day types.
 				periodEnd:   periodEnd,
 				subject:     subjectDisplay,
 				periodType:  "ปฏิบัติ",
+				role:        instructorRole(isMain),
 				groups:      groupNames,
 				room:        roomName,
 			})
@@ -542,7 +505,7 @@ func (r *TimetableRenderer) mergeInstructorPeriods(periods []*periodEntry, unava
 		if lp > 0 {
 			hasFullDayUnavailable := false
 			for _, iu := range r.config.InstructorUnavailable {
-				if iu.InstructorID == instructorID && iu.Day == day && iu.StartPeriod == 1 && iu.EndPeriod == 13 {
+				if iu.InstructorID == instructorID && iu.Day == day && types.IsFullDay(iu.StartPeriod, iu.EndPeriod) {
 					hasFullDayUnavailable = true
 					break
 				}
@@ -592,6 +555,7 @@ func (r *TimetableRenderer) mergeInstructorPeriods(periods []*periodEntry, unava
 			periodEnd:   pe.periodEnd,
 			subject:     pe.subject,
 			periodType:  pe.periodType,
+			role:        pe.role,
 			groups:      pe.groups,
 			room:        pe.room,
 		}
@@ -640,6 +604,7 @@ func (r *TimetableRenderer) buildGroupPeriodEntries(groupID string, day types.Da
 					periodEnd:   p,
 					subject:     courseName,
 					periodType:  "ทฤษฎี",
+					role:        roleMain,
 					groups:      instructorStr,
 					room:        roomName,
 				}
@@ -662,6 +627,7 @@ func (r *TimetableRenderer) buildGroupPeriodEntries(groupID string, day types.Da
 					periodEnd:   p,
 					subject:     courseName,
 					periodType:  "ปฏิบัติ",
+					role:        coRole(offering),
 					groups:      instructorStr,
 					room:        roomName,
 				}
@@ -679,7 +645,7 @@ func (r *TimetableRenderer) buildGroupPeriodEntries(groupID string, day types.Da
 		if lp > 0 {
 			hasFullDayUnavailable := false
 			for _, gu := range r.config.GroupsUnavailable {
-				if gu.GroupID == groupID && gu.Day == day && gu.StartPeriod == 1 && gu.EndPeriod == 13 {
+				if gu.GroupID == groupID && gu.Day == day && types.IsFullDay(gu.StartPeriod, gu.EndPeriod) {
 					hasFullDayUnavailable = true
 					break
 				}
@@ -727,6 +693,7 @@ func (r *TimetableRenderer) buildGroupPeriodEntries(groupID string, day types.Da
 			periodEnd:   sortedPeriods[j],
 			subject:     pe.subject,
 			periodType:  pe.periodType,
+			role:        pe.role,
 			groups:      pe.groups,
 			room:        pe.room,
 		}
@@ -761,6 +728,7 @@ func (r *TimetableRenderer) buildRoomPeriodEntries(roomID string, day types.Day)
 					periodEnd:   p,
 					subject:     courseName,
 					periodType:  "ทฤษฎี",
+					role:        roleMain,
 					groups:      groupNames,
 					room:        instructorStr,
 				}
@@ -778,6 +746,7 @@ func (r *TimetableRenderer) buildRoomPeriodEntries(roomID string, day types.Day)
 					periodEnd:   p,
 					subject:     courseName,
 					periodType:  "ปฏิบัติ",
+					role:        coRole(offering),
 					groups:      groupNames,
 					room:        instructorStr,
 				}
@@ -867,6 +836,7 @@ func (r *TimetableRenderer) buildRoomPeriodEntries(roomID string, day types.Day)
 			periodEnd:   sortedPeriods[j],
 			subject:     pe.subject,
 			periodType:  pe.periodType,
+			role:        pe.role,
 			groups:      pe.groups,
 			room:        pe.room,
 		}
