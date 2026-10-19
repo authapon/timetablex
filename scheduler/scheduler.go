@@ -616,67 +616,12 @@ func (s *Scheduler) backtrackSchedule(units []unit,
 			p := top.positions[top.posIndex]
 			top.posIndex++
 
-			// Verify room availability now (resources may have changed)
-			theoryRoom := p.theoryRoom
-			labRoom := p.labRoom
-
-			if u.theoryPeriods > 0 && u.offering.TheoryRoomRaw != "x" && len(u.offering.TheoryRoomIDs) > 0 {
-				foundRoom := false
-				for _, tr := range u.offering.TheoryRoomIDs {
-					avail := true
-					for pp := p.start; pp < p.start+u.theoryPeriods; pp++ {
-						rk := resourceKey{day: p.day, period: pp}
-						if roomB[tr] != nil && roomB[tr][rk] {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByInstructorUnavailable(tr, p.day, pp) {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByGroupsUnavailable(tr, p.day, pp) {
-							avail = false
-							break
-						}
-					}
-					if avail {
-						theoryRoom = tr
-						foundRoom = true
-						break
-					}
-				}
-				if !foundRoom {
-					continue
-				}
-			}
-			if u.labPeriods > 0 && u.offering.LabRoomRaw != "x" && len(u.offering.LabRoomIDs) > 0 {
-				foundRoom := false
-				for _, lr := range u.offering.LabRoomIDs {
-					avail := true
-					for pp := p.start + u.theoryPeriods; pp < p.start+u.totalPeriods; pp++ {
-						rk := resourceKey{day: p.day, period: pp}
-						if roomB[lr] != nil && roomB[lr][rk] {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByInstructorUnavailable(lr, p.day, pp) {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByGroupsUnavailable(lr, p.day, pp) {
-							avail = false
-							break
-						}
-					}
-					if avail {
-						labRoom = lr
-						foundRoom = true
-						break
-					}
-				}
-				if !foundRoom {
-					continue
-				}
+			// Verify room availability now (resources may have changed),
+			// preferring the same room for theory and lab
+			theoryRoom, labRoom, ok := s.pickRooms(u.offering, p.day, p.start,
+				u.theoryPeriods, u.labPeriods, roomB, false)
+			if !ok {
+				continue
 			}
 
 			if !s.checkConstraints(u.offering, p.day, p.start, u.totalPeriods, instB, grpB) {
@@ -729,6 +674,80 @@ func (s *Scheduler) backtrackSchedule(units []unit,
 	}
 
 	return nil, false
+}
+
+// freeRooms returns the rooms from candidates that are free (not booked and not
+// reserved by instructor/group unavailability) for periods [from, to) on the given day.
+func (s *Scheduler) freeRooms(candidates []string, day types.Day, from, to int,
+	roomB map[string]map[resourceKey]bool) []string {
+	var free []string
+	for _, rm := range candidates {
+		avail := true
+		for p := from; p < to; p++ {
+			rk := resourceKey{day: day, period: p}
+			if (roomB[rm] != nil && roomB[rm][rk]) ||
+				s.isRoomReservedByInstructorUnavailable(rm, day, p) ||
+				s.isRoomReservedByGroupsUnavailable(rm, day, p) {
+				avail = false
+				break
+			}
+		}
+		if avail {
+			free = append(free, rm)
+		}
+	}
+	return free
+}
+
+// pickRooms chooses the theory and lab rooms for an offering placed at (day, start).
+// When both theory and lab need a room, it prefers one room that serves both blocks
+// and falls back to different rooms only when no such common room is free.
+// Rooms flagged "x" are returned as "x". ok is false if a required room is unavailable.
+func (s *Scheduler) pickRooms(o *types.Offering, day types.Day, start, theoryPeriods, labPeriods int,
+	roomB map[string]map[resourceKey]bool, shuffle bool) (theoryRoom, labRoom string, ok bool) {
+	theoryRoom, labRoom = "x", "x"
+
+	order := func(ids []string) []string {
+		rooms := make([]string, len(ids))
+		copy(rooms, ids)
+		if shuffle {
+			s.rng.Shuffle(len(rooms), func(i, j int) { rooms[i], rooms[j] = rooms[j], rooms[i] })
+		}
+		return rooms
+	}
+
+	needTheory := theoryPeriods > 0 && o.TheoryRoomRaw != "x" && len(o.TheoryRoomIDs) > 0
+	needLab := labPeriods > 0 && o.LabRoomRaw != "x" && len(o.LabRoomIDs) > 0
+
+	var theoryFree, labFree []string
+	if needTheory {
+		theoryFree = s.freeRooms(order(o.TheoryRoomIDs), day, start, start+theoryPeriods, roomB)
+		if len(theoryFree) == 0 {
+			return "x", "x", false
+		}
+		theoryRoom = theoryFree[0]
+	}
+	if needLab {
+		labFree = s.freeRooms(order(o.LabRoomIDs), day, start+theoryPeriods, start+theoryPeriods+labPeriods, roomB)
+		if len(labFree) == 0 {
+			return "x", "x", false
+		}
+		labRoom = labFree[0]
+	}
+
+	// Prefer the same room for both blocks; differ only when no common room is free
+	if needTheory && needLab {
+		inLab := make(map[string]bool, len(labFree))
+		for _, r := range labFree {
+			inLab[r] = true
+		}
+		for _, r := range theoryFree {
+			if inLab[r] {
+				return r, r, true
+			}
+		}
+	}
+	return theoryRoom, labRoom, true
 }
 
 // genPositions generates valid (day, start) positions for an offering
@@ -833,64 +852,10 @@ func (s *Scheduler) genPositions(
 				continue
 			}
 
-			// Pick first available rooms
-			theoryRoom := "x"
-			labRoom := "x"
-
-			if u.theoryPeriods > 0 && o.TheoryRoomRaw != "x" && len(o.TheoryRoomIDs) > 0 {
-				for _, tr := range o.TheoryRoomIDs {
-					avail := true
-					for pp := start; pp < start+u.theoryPeriods; pp++ {
-						rk := resourceKey{day: day, period: pp}
-						if roomB[tr] != nil && roomB[tr][rk] {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByInstructorUnavailable(tr, day, pp) {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByGroupsUnavailable(tr, day, pp) {
-							avail = false
-							break
-						}
-					}
-					if avail {
-						theoryRoom = tr
-						break
-					}
-				}
-				if theoryRoom == "x" {
-					continue // no room
-				}
-			}
-
-			if u.labPeriods > 0 && o.LabRoomRaw != "x" && len(o.LabRoomIDs) > 0 {
-				for _, lr := range o.LabRoomIDs {
-					avail := true
-					for pp := start + u.theoryPeriods; pp < start+total; pp++ {
-						rk := resourceKey{day: day, period: pp}
-						if roomB[lr] != nil && roomB[lr][rk] {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByInstructorUnavailable(lr, day, pp) {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByGroupsUnavailable(lr, day, pp) {
-							avail = false
-							break
-						}
-					}
-					if avail {
-						labRoom = lr
-						break
-					}
-				}
-				if labRoom == "x" {
-					continue // no room
-				}
+			// Pick rooms (same room for theory and lab whenever possible)
+			theoryRoom, labRoom, ok := s.pickRooms(o, day, start, u.theoryPeriods, u.labPeriods, roomB, false)
+			if !ok {
+				continue // no room
 			}
 
 			positions = append(positions, pos{
@@ -1580,67 +1545,8 @@ func (s *Scheduler) randomShift(schedule *types.Schedule) ([]*types.Assignment, 
 				continue
 			}
 
-			theoryRoom := "x"
-			labRoom := "x"
-
-			if o.TheoryPeriods > 0 && o.TheoryRoomRaw != "x" && len(o.TheoryRoomIDs) > 0 {
-				rooms := make([]string, len(o.TheoryRoomIDs))
-				copy(rooms, o.TheoryRoomIDs)
-				s.rng.Shuffle(len(rooms), func(i, j int) { rooms[i], rooms[j] = rooms[j], rooms[i] })
-				for _, tr := range rooms {
-					avail := true
-					for p := start; p < start+o.TheoryPeriods; p++ {
-						rk := resourceKey{day: day, period: p}
-						if roomB[tr] != nil && roomB[tr][rk] {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByInstructorUnavailable(tr, day, p) {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByGroupsUnavailable(tr, day, p) {
-							avail = false
-							break
-						}
-					}
-					if avail {
-						theoryRoom = tr
-						break
-					}
-				}
-			}
-
-			if o.LabPeriods > 0 && o.LabRoomRaw != "x" && len(o.LabRoomIDs) > 0 {
-				rooms := make([]string, len(o.LabRoomIDs))
-				copy(rooms, o.LabRoomIDs)
-				s.rng.Shuffle(len(rooms), func(i, j int) { rooms[i], rooms[j] = rooms[j], rooms[i] })
-				for _, lr := range rooms {
-					avail := true
-					for p := start + o.TheoryPeriods; p <= end; p++ {
-						rk := resourceKey{day: day, period: p}
-						if roomB[lr] != nil && roomB[lr][rk] {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByInstructorUnavailable(lr, day, p) {
-							avail = false
-							break
-						}
-						if s.isRoomReservedByGroupsUnavailable(lr, day, p) {
-							avail = false
-							break
-						}
-					}
-					if avail {
-						labRoom = lr
-						break
-					}
-				}
-			}
-
-			if (o.TheoryPeriods > 0 && o.TheoryRoomRaw != "x" && theoryRoom == "x") ||
-				(o.LabPeriods > 0 && o.LabRoomRaw != "x" && labRoom == "x") {
+			theoryRoom, labRoom, roomsOK := s.pickRooms(o, day, start, o.TheoryPeriods, o.LabPeriods, roomB, true)
+			if !roomsOK {
 				continue
 			}
 
