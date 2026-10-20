@@ -179,7 +179,7 @@ func (s *Scheduler) scheduleWithinLimit() (*types.Schedule, error) {
 				found := false
 				for i := len(s.config.Breaks.Periods) - 1; i >= 0; i-- {
 					bp := s.config.Breaks.Periods[i]
-					if !s.hasPredefinedBreakConflictOnDay(bp, day) &&
+					if !s.instructorHasPredefinedAt(instID, day, bp) &&
 						!s.isInstructorUnavailable(instID, day, bp) {
 						dayBreaks[day] = bp
 						dayPriorities[day] = i + 1
@@ -207,7 +207,7 @@ func (s *Scheduler) scheduleWithinLimit() (*types.Schedule, error) {
 				found := false
 				for i := len(s.config.Breaks.Periods) - 1; i >= 0; i-- {
 					bp := s.config.Breaks.Periods[i]
-					if !s.hasPredefinedBreakConflictOnDay(bp, day) &&
+					if !s.groupHasPredefinedAt(groupID, day, bp) &&
 						!s.isGroupUnavailable(groupID, day, bp) {
 						dayBreaks[day] = bp
 						dayPriorities[day] = i + 1
@@ -402,7 +402,7 @@ func (s *Scheduler) buildEntityBreaks() (map[string]map[types.Day]int, map[strin
 			}
 			found := false
 			for _, bp := range s.config.Breaks.Periods {
-				if !s.hasPredefinedBreakConflictOnDay(bp, day) &&
+				if !s.instructorHasPredefinedAt(instID, day, bp) &&
 					!s.isInstructorUnavailable(instID, day, bp) {
 					dayBreaks[day] = bp
 					found = true
@@ -427,7 +427,7 @@ func (s *Scheduler) buildEntityBreaks() (map[string]map[types.Day]int, map[strin
 			}
 			found := false
 			for _, bp := range s.config.Breaks.Periods {
-				if !s.hasPredefinedBreakConflictOnDay(bp, day) &&
+				if !s.groupHasPredefinedAt(groupID, day, bp) &&
 					!s.isGroupUnavailable(groupID, day, bp) {
 					dayBreaks[day] = bp
 					found = true
@@ -1563,7 +1563,9 @@ func (s *Scheduler) tryUpgradeEntityBreaks(schedule *types.Schedule) bool {
 
 		// ลอง upgrade ไปยัง higher-priority break ที่ compatible สำหรับ entity นี้
 		for _, bp := range higherBreaks {
-			if s.hasPredefinedBreakConflictOnDay(bp, day) {
+			// Skip periods in which this entity has a pre-defined class
+			if (entityType == "instructor" && s.instructorHasPredefinedAt(entityID, day, bp)) ||
+				(entityType == "group" && s.groupHasPredefinedAt(entityID, day, bp)) {
 				continue
 			}
 
@@ -2195,15 +2197,57 @@ func (s *Scheduler) findAvailableRoom(day types.Day, startPeriod, endPeriod int,
 	return ""
 }
 
-// hasPredefinedBreakConflictOnDay checks if any predefined assignment covers the given break period
-// on the specified day. This enables per-day break period selection.
-func (s *Scheduler) hasPredefinedBreakConflictOnDay(breakPeriod int, day types.Day) bool {
+// instructorHasPredefinedAt reports whether the instructor teaches a pre-defined class in
+// the given period (the main instructor in the whole class, a co-instructor in its lab block).
+func (s *Scheduler) instructorHasPredefinedAt(instructorID string, day types.Day, period int) bool {
 	for _, pa := range s.predefinedAssignments {
-		if IsInPredefinedPeriod(pa, day, breakPeriod) {
+		if !IsInPredefinedPeriod(pa, day, period) {
+			continue
+		}
+		if pa.MainInstructorID == instructorID {
 			return true
+		}
+		inLab := pa.LabStart > 0 && period >= pa.LabStart && period < pa.LabStart+pa.LabPeriods
+		if inLab {
+			for _, coID := range pa.CoInstructorIDs {
+				if coID == instructorID {
+					return true
+				}
+			}
 		}
 	}
 	return false
+}
+
+// groupHasPredefinedAt reports whether the group has a pre-defined class in the given period.
+func (s *Scheduler) groupHasPredefinedAt(groupID string, day types.Day, period int) bool {
+	for _, pa := range s.predefinedAssignments {
+		if !IsInPredefinedPeriod(pa, day, period) {
+			continue
+		}
+		for _, gid := range pa.GroupIDs {
+			if gid == groupID {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// PredefinedOnlySchedule returns an empty schedule carrying only the lunch breaks, for when
+// every offering is already pre-defined. Each instructor and group gets, per day, the
+// highest-priority break period that is free of their own pre-defined classes and
+// unavailable periods.
+func (s *Scheduler) PredefinedOnlySchedule() *types.Schedule {
+	instBreak, groupBreak := s.buildEntityBreaks()
+	instPriority, groupPriority := s.buildEntityBreakPriorities(instBreak, groupBreak)
+	return &types.Schedule{
+		InstructorLunchBreak:    instBreak,
+		GroupLunchBreak:         groupBreak,
+		InstructorBreakPriority: instPriority,
+		GroupBreakPriority:      groupPriority,
+		Config:                  s.config,
+	}
 }
 
 // IsInPredefinedPeriod checks if the given period on the specified day is covered

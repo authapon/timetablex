@@ -443,7 +443,8 @@ func ValidatePredefined(config *types.Config, data *types.PredefinedData) []Pred
 				// Check main vs co overlap
 				isLabA := a.LabStart > 0 && p >= a.LabStart
 				isLabB := b.LabStart > 0 && p >= b.LabStart
-				if isLabB {
+				// a co-instructor only teaches during the lab block of their own class
+				if isLabA {
 					for _, coA := range a.CoInstructorIDs {
 						if coA == b.MainInstructorID {
 							errs = append(errs, PredefinedValidationError{
@@ -454,7 +455,7 @@ func ValidatePredefined(config *types.Config, data *types.PredefinedData) []Pred
 						}
 					}
 				}
-				if isLabA {
+				if isLabB {
 					for _, coB := range b.CoInstructorIDs {
 						if coB == a.MainInstructorID {
 							errs = append(errs, PredefinedValidationError{

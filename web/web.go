@@ -322,66 +322,7 @@ func runScheduling(configPath, predefinedPath string, attempts int) (mdContent, 
 			return "", "", fmt.Sprintf("Error: %v", err)
 		}
 	} else if hasPredefined {
-		instBreak := make(map[string]map[types.Day]int)
-		groupBreak := make(map[string]map[types.Day]int)
-		instPriority := make(map[string]map[types.Day]int)
-		groupPriority := make(map[string]map[types.Day]int)
-
-		if len(parseResult.Config.Breaks.Periods) > 0 {
-			chosenBreak := 0
-			breakPriority := 1
-			for _, bp := range parseResult.Config.Breaks.Periods {
-				hasConflict := false
-				for _, pa := range predefinedData.Assignments {
-					if scheduler.IsInPredefinedPeriod(pa, pa.Day, bp) {
-						hasConflict = true
-						break
-					}
-				}
-				if !hasConflict {
-					chosenBreak = bp
-					break
-				}
-			}
-			if chosenBreak == 0 && len(parseResult.Config.Breaks.Periods) > 0 {
-				chosenBreak = parseResult.Config.Breaks.Periods[0]
-			}
-			for i, bp := range parseResult.Config.Breaks.Periods {
-				if bp == chosenBreak {
-					breakPriority = i + 1
-					break
-				}
-			}
-
-			for instID := range parseResult.Config.Instructors {
-				dayBreaks := make(map[types.Day]int)
-				dayPriorities := make(map[types.Day]int)
-				for _, day := range types.AllDays() {
-					dayBreaks[day] = chosenBreak
-					dayPriorities[day] = breakPriority
-				}
-				instBreak[instID] = dayBreaks
-				instPriority[instID] = dayPriorities
-			}
-			for groupID := range parseResult.Config.Groups {
-				dayBreaks := make(map[types.Day]int)
-				dayPriorities := make(map[types.Day]int)
-				for _, day := range types.AllDays() {
-					dayBreaks[day] = chosenBreak
-					dayPriorities[day] = breakPriority
-				}
-				groupBreak[groupID] = dayBreaks
-				groupPriority[groupID] = dayPriorities
-			}
-		}
-
-		schedule = &types.Schedule{
-			InstructorLunchBreak:    instBreak,
-			GroupLunchBreak:         groupBreak,
-			InstructorBreakPriority: instPriority,
-			GroupBreakPriority:      groupPriority,
-			Config:                  parseResult.Config,
-		}
+		schedule = sch.PredefinedOnlySchedule()
 	}
 
 	if schedule == nil {
